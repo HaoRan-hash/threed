@@ -1,0 +1,459 @@
+import torch
+import numpy as np
+from torch.utils.data import DataLoader
+from torch import nn
+import torch.nn.functional as F
+from ignite.metrics import Accuracy
+from tqdm import tqdm
+import sys
+sys.path.append('/home/lindi/chenhr/threed/pointmeta')
+from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PolyFocalLoss
+from dataset import ShapeNet
+from data_aug import *
+from data_aug_tensor import *
+import fps_cuda
+import json
+
+
+class PointSetAbstractionLayer(nn.Module):
+    def __init__(self, stride, radius, k, in_channels, mlp_units):
+        super(PointSetAbstractionLayer, self).__init__()
+        self.stride = stride
+        self.radius = radius
+        self.k = k
+        
+        x_mlp = [nn.Conv1d(in_channels, mlp_units[0], kernel_size=1),
+                    nn.BatchNorm1d(mlp_units[0]),
+                    nn.ReLU(inplace=True)]
+        for i in range(len(mlp_units) - 2):
+            x_mlp += [nn.Conv1d(mlp_units[i], mlp_units[i + 1], kernel_size=1),
+                    nn.BatchNorm1d(mlp_units[i + 1]),
+                    nn.ReLU(inplace=True)]
+        x_mlp += [nn.Conv1d(mlp_units[-2], mlp_units[-1], kernel_size=1),
+                    nn.BatchNorm1d(mlp_units[-1])]
+
+        self.x_mlp = nn.Sequential(*x_mlp)
+        
+        self.pos_mlp = nn.Sequential(nn.Conv2d(3, 32, kernel_size=1),
+                                     nn.BatchNorm2d(32),
+                                     nn.ReLU(True),
+                                     nn.Conv2d(32, 32, kernel_size=1),
+                                     nn.BatchNorm2d(32),
+                                     nn.ReLU(True),
+                                     nn.Conv2d(32, mlp_units[-1], kernel_size=1),
+                                     nn.BatchNorm2d(mlp_units[-1]),
+                                     nn.ReLU(True))
+        self.skip_mlp = nn.Linear(in_channels, mlp_units[-1])
+    
+    @torch.no_grad()
+    def fps(self, points):
+        """
+        points.shape = (b, n, 3)
+        return indices.shape = (b, self.nsamples)
+        """
+        b, n, _ = points.shape
+        device = points.device
+        dis = torch.ones((b, n), device=device) * 1e10
+        indices = torch.zeros((b, self.nsamples), device=device, dtype=torch.long)
+
+        fps_cuda.fps(points, dis, indices)
+        return indices
+    
+    def group(self, points, features, centroids):
+        """
+        points.shape = (b, n, 3)
+        features.shape = (b, n, c)
+        centroids.shape = (b, self.nsamples, 3)
+        return res.shape = (b, 3+c, k, self.nsamples)
+        """
+        group_points, group_features, _ = ball_query_cuda2(self.radius, self.k, centroids, points, features)
+        
+        group_points = group_points - centroids.transpose(1, 2).unsqueeze(dim=2)   # 要的是相对坐标
+        group_points = self.pos_mlp(group_points / self.radius)
+
+        res = group_features + group_points
+        return res
+        
+    def forward(self, points, features, gts=None):
+        """
+        points.shape = (b, n, 3)   坐标信息
+        features.shape = (b, n, c)   特征信息
+        gts.shape = (b, n)
+        return centroids.shape = (b, self.nsamples, 3)
+        return group_features.shape = (b, self.nsamples, c')
+        return gts.shape = (b, self.nsamples)
+        """
+        self.nsamples = points.shape[1] // self.stride
+        
+        fps_indices = self.fps(points)
+
+        centroids = index_points(points, fps_indices)
+        cen_features = index_points(features, fps_indices)
+        if gts is not None:
+            gts = index_gts(gts, fps_indices)
+
+        features = self.x_mlp(features.transpose(1, 2)).transpose(1, 2)
+        group_features = self.group(points, features, centroids)
+
+        group_features, _ = group_features.max(dim=2)
+        group_features = F.relu(group_features.transpose(1, 2) + self.skip_mlp(cen_features), True)
+
+        return centroids, group_features, gts
+
+
+class PointFeaturePropagationLayer(nn.Module):
+    def __init__(self, in_channels, mlp_units):
+        super(PointFeaturePropagationLayer, self).__init__()
+        mlp = [nn.Conv1d(in_channels, mlp_units[0], kernel_size=1),
+                    nn.BatchNorm1d(mlp_units[0]),
+                    nn.ReLU(inplace=True)]
+        for i in range(len(mlp_units) - 1):
+            mlp += [nn.Conv1d(mlp_units[i], mlp_units[i + 1], kernel_size=1),
+                    nn.BatchNorm1d(mlp_units[i + 1]),
+                    nn.ReLU(inplace=True)]
+
+        self.mlp = nn.Sequential(*mlp)
+    
+    def forward(self, points_1, features_1, points_2, features_2):
+        """
+        points_1来自于更前面层的输出, 点更多
+        points_1.shape = (b, n1, 3)
+        features_1.shape = (b, n1, c1)
+        points_2.shape = (b, n2, 3)
+        features_2.shape = (b, n2, c2)
+        return final_features.shape = (b, n1, c')
+        """
+        _, correspond_features, distance = knn_query_cuda2(3, points_1, points_2, features_2)
+
+        dist_recip = 1/ (distance + 1e-8)
+        norm_term = dist_recip.sum(dim=-1, keepdim=True)
+        weights = dist_recip / norm_term
+
+        receive_features = torch.sum(weights.transpose(1, 2).unsqueeze(dim=1) * correspond_features, dim=2)
+        
+        final_features = torch.cat((receive_features, features_1.transpose(1, 2)), dim=1)
+
+        final_features = self.mlp(final_features).transpose(1, 2)
+
+        return final_features
+
+
+class PointMeta(nn.Module):
+    def __init__(self, class_num):
+        super(PointMeta, self).__init__()
+        self.in_linear = nn.Linear(7, 160)
+        self.sa1 = PointSetAbstractionLayer(2, 0.1, 32, 160, [160, 160, 320])
+        self.sa2 = PointSetAbstractionLayer(2, 0.1*2.5, 32, 320, [320, 320, 640])
+        self.sa3 = PointSetAbstractionLayer(2, 0.1*2.5*2.5, 32, 640, [640, 640, 1280])
+        self.sa4 = PointSetAbstractionLayer(2, 0.1*2.5*2.5*2.5, 32, 1280, [1280, 1280, 2560])
+        
+        self.global_conv1 = nn.Sequential(nn.Linear(2560, 128),
+                                          nn.ReLU(True))
+        self.global_conv2 = nn.Sequential(nn.Linear(1280, 64),
+                                          nn.ReLU(True))
+
+        self.fp1 = PointFeaturePropagationLayer(2560+1280, [1280, 1280])
+        self.fp2 = PointFeaturePropagationLayer(1280+640, [640, 640])
+        self.fp3 = PointFeaturePropagationLayer(640+320, [320, 320])
+        self.fp4 = PointFeaturePropagationLayer(320+128+64+160+16, [160, 160])
+
+        self.mlp = nn.Sequential(nn.Conv1d(480, 480, kernel_size=1),
+                                    nn.BatchNorm1d(480),
+                                    nn.ReLU(inplace=True),
+                                    nn.Dropout(0.5),
+                                    nn.Conv1d(480, class_num, kernel_size=1))
+
+    def forward(self, pos, x, object_labels, y=None):
+        """
+        pos.shape = (b, n, 3)
+        x.shape = (b, n, 4)
+        object_labels.shape = (b,)
+        y.shape = (b, n)
+        """
+        n = pos.shape[1]
+        x = torch.cat((pos, x), dim=-1)
+        x = self.in_linear(x)
+
+        object_labels = F.one_hot(object_labels, 16).to(dtype=torch.float32)
+        object_labels = object_labels.unsqueeze(dim=1).expand(-1, n, -1)
+
+        pos1, x1, y1 = self.sa1(pos, x, y)
+        pos2, x2, y2 = self.sa2(pos1, x1, y1)
+        pos3, x3, y3 = self.sa3(pos2, x2, y2)
+        pos4, x4, y4 = self.sa4(pos3, x3, y3)
+        
+        global_x4 = self.global_conv1(x4).max(dim=1, keepdim=True)[0].expand(-1, n, -1)   # shape = (b, n, 128)
+        global_x3 = self.global_conv2(x3).max(dim=1, keepdim=True)[0].expand(-1, n, -1)
+
+        x3 = self.fp1(pos3, x3, pos4, x4)
+        x2 = self.fp2(pos2, x2, pos3, x3)
+        x1 = self.fp3(pos1, x1, pos2, x2)
+        x = self.fp4(pos, torch.cat((x, global_x4, global_x3, object_labels), dim=-1), pos1, x1)
+
+        x_max = x.max(dim=1, keepdim=True)[0].expand(-1, n, -1)
+        x_mean = x.mean(dim=1, keepdim=True).expand(-1, n, -1)
+        x = torch.cat((x, x_max, x_mean), dim=-1)
+        y_pred = self.mlp(x.transpose(1, 2))
+
+        return y_pred, None, None
+
+
+def train_loop(dataloader, model, loss_fn, metric_fn, optimizer, device, 
+               cur_epoch, total_epoch, show_gap, interval):
+    model.train()
+    if cur_epoch % show_gap == 0:
+        pbar = tqdm(dataloader, desc=f'Epoch {cur_epoch}/{total_epoch}', unit='batch')
+    else:
+        pbar = dataloader
+    
+    scaler = torch.cuda.amp.GradScaler()
+    
+    for i, (pos, x, y, object_labels) in enumerate(pbar):
+        pos = pos.to(device)
+        x = x.to(device)
+        y = y.to(device)
+        object_labels = object_labels.to(device)
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            y_pred = model(pos, x, object_labels)
+            loss = loss_fn(y_pred, y)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
+        # loss.backward()
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # optimizer.step()
+
+        metric_fn.reset()
+        metric_fn.update((y_pred, y))
+        acc = metric_fn.compute()
+
+        if cur_epoch % show_gap == 0 and i % interval == 0:
+            pbar.set_postfix_str(f'loss={loss:.4f}, acc={acc:.4f}')
+
+
+def refine_seg(y_pred, pos, k, device):
+    """
+    y_pred.shape = (n, )
+    pos.shape = (n, 3)
+    """
+    parts, counts = y_pred.unique(return_counts=True)
+    for part, count in zip(parts, counts):
+        if count < 10:
+            mask = (y_pred == part)
+            _, neigh_pred, _ = knn_query_cuda2(k + 1, pos[mask].unsqueeze(dim=0), pos.unsqueeze(dim=0), y_pred.view(1, len(y_pred), 1).to(dtype=torch.float32))
+            neigh_pred = neigh_pred.permute(0, 3, 2, 1).view(count, k + 1).to(dtype=torch.long)
+            
+            neigh_pred_counts = torch.zeros((count, 50), dtype=torch.long, device=device)
+            neigh_pred_counts.scatter_add_(dim=1, index=neigh_pred, src=torch.ones_like(neigh_pred))
+            
+            y_pred[mask] = neigh_pred_counts.argmax(dim=-1)
+    return y_pred
+
+
+best_miou = 0
+best_epoch = 0
+object_to_part = {0: [0, 1, 2, 3], 1: [4, 5], 2: [6, 7], 3: [8, 9, 10, 11], 4: [12, 13, 14, 15], 5: [16, 17, 18], 
+                    6: [19, 20, 21], 7: [22, 23], 8: [24, 25, 26, 27], 9: [28, 29], 10: [30, 31, 32, 33, 34, 35],
+                    11: [36, 37], 12: [38, 39, 40], 13: [41, 42, 43], 14: [44, 45, 46], 15: [47, 48, 49]}
+def val_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, device, cur_epoch, path, show_gap, log_dir):
+    model.eval()
+    steps = len(dataloader)
+    idx_to_class = dataloader.dataset.idx_to_class
+    loss = 0
+    object_mious = [[] for _ in range(16)]
+    
+    with torch.no_grad():
+        for pos, x, y, object_labels in dataloader:
+            pos = pos.to(device)
+            x = x.to(device)
+            y = y.to(device)
+            object_labels = object_labels.to(device)
+            with torch.cuda.amp.autocast():
+                y_pred = model(pos, x, object_labels)
+                loss += loss_fn(y_pred, y)
+            y_pred = y_pred.to(torch.float32)
+            
+            y_pred = y_pred.permute(0, 2, 1)
+            y_pred = F.softmax(y_pred, dim=-1)
+            for i in range(len(y_pred)):
+                cur_object_label = object_labels[i].item()
+                cur_y_pred = y_pred[i, :, object_to_part[cur_object_label]].argmax(dim=-1)   # 相当于做了mask
+                cur_y_pred += object_to_part[cur_object_label][0]
+                cur_y = y[i]
+                
+                temp = []
+                for part_class in object_to_part[cur_object_label]:
+                    if (torch.sum(cur_y == part_class) == 0 and torch.sum(cur_y_pred == part_class) == 0):
+                        temp.append(1)
+                    else:
+                        intersection = torch.sum((cur_y == part_class) & (cur_y_pred == part_class)).item()
+                        union = torch.sum((cur_y == part_class) | (cur_y_pred == part_class)).item()
+                        temp.append(intersection / union)
+                object_mious[cur_object_label].append(np.mean(temp))
+        
+    loss = loss / steps
+    cat_mious = [np.mean(object_mious[i]) for i in range(16)]
+    all_mious = [y for x in object_mious for y in x]
+    ins_miou = np.mean(all_mious)
+    cat_miou = np.mean(cat_mious)
+
+    global best_miou, best_epoch
+    if ins_miou >= best_miou:
+        best_miou = ins_miou
+        best_epoch = cur_epoch
+        torch.save({'epoch': cur_epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': lr_scheduler.state_dict(),
+                        'miou': best_miou}, path)
+
+    if cur_epoch % show_gap == 0:
+        with open(log_dir, mode='a') as f:
+            f.write(f'Epoch {cur_epoch}\n\n')
+            for i in range(16):
+                f.write(f'{idx_to_class[i]}:   {cat_mious[i]:.4f}\n')
+            f.write(f'val_loss={loss:.4f}, ins_miou={ins_miou:.4f}, cat_miou={cat_miou:.4f}\n')
+            f.write('-------------------------------------------------------\n')
+        print(f'val_loss={loss:.4f}, ins_miou={ins_miou:.4f}, cat_miou={cat_miou:.4f}')
+
+
+def voting_test(dataloader, model, loss_fn, device, model_path, log_dir, voting_num):
+    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
+    model.eval()
+    steps = len(dataloader)
+    idx_to_class = dataloader.dataset.idx_to_class
+    loss = 0
+    object_mious = [[] for _ in range(16)]
+    voting_transforms = Compose([PointCloudScalingBatch(0.8, 1.2)])
+
+    with torch.no_grad():
+        for pos, x, y, object_labels in tqdm(dataloader):
+            pos = pos.to(device)
+            x = x.to(device)
+            y = y.to(device)
+            object_labels = object_labels.to(device)
+            
+            # voting test
+            y_pred = torch.zeros((pos.shape[0], 50, pos.shape[1]), dtype=torch.float32, device=device)
+            for i in range(voting_num):
+                temp_pos, temp_x = voting_transforms(pos, x)
+                temp_pred = model(temp_pos, temp_x, object_labels)
+                y_pred += temp_pred
+            y_pred = y_pred / voting_num
+            
+            loss += loss_fn(y_pred, y)
+            
+            y_pred = y_pred.permute(0, 2, 1)
+            y_pred = F.softmax(y_pred, dim=-1)
+            for i in range(len(y_pred)):
+                cur_object_label = object_labels[i].item()
+                cur_y_pred = y_pred[i, :, object_to_part[cur_object_label]].argmax(dim=-1)   # 相当于做了mask
+                cur_y_pred += object_to_part[cur_object_label][0]
+                cur_y = y[i]
+                
+                # refine seg
+                cur_y_pred = refine_seg(cur_y_pred, pos[i], 10, device)
+                
+                temp = []
+                for part_class in object_to_part[cur_object_label]:
+                    if (torch.sum(cur_y == part_class) == 0 and torch.sum(cur_y_pred == part_class) == 0):
+                        temp.append(1)
+                    else:
+                        intersection = torch.sum((cur_y == part_class) & (cur_y_pred == part_class)).item()
+                        union = torch.sum((cur_y == part_class) | (cur_y_pred == part_class)).item()
+                        temp.append(intersection / union)
+                object_mious[cur_object_label].append(np.mean(temp))
+                
+    loss = loss / steps
+    cat_mious = [np.mean(object_mious[i]) for i in range(16)]
+    all_mious = [y for x in object_mious for y in x]
+    ins_miou = np.mean(all_mious)
+    cat_miou = np.mean(cat_mious)
+    
+    with open(log_dir, mode='a') as f:
+        for i in range(16):
+            f.write(f'{idx_to_class[i]}:   {cat_mious[i]:.4f}\n')
+        f.write(f'test_loss={loss:.4f}, ins_miou={ins_miou:.4f}, cat_miou={cat_miou:.4f}\n')
+        f.write('-------------------------------------------------------\n')
+    print(f'test_loss={loss:.4f}, ins_miou={ins_miou:.4f}, cat_miou={cat_miou:.4f}')            
+
+
+def get_parameter_groups(model, weight_decay, log_dir):
+    parameter_group_names = {'decay': {'weight_decay': weight_decay,
+                                       'params': []},
+                             'no_decay': {'weight_decay': 0,
+                                          'params': []}}
+    parameter_group_vars = {'decay': {'weight_decay': weight_decay,
+                                       'params': []},
+                             'no_decay': {'weight_decay': 0,
+                                          'params': []}}
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  
+        
+        if len(param.shape) == 1 or name.endswith('.bias'):
+            group_name = 'no_decay'
+        else:
+            group_name = 'decay'
+        
+        parameter_group_names[group_name]['params'].append(name)
+        parameter_group_vars[group_name]['params'].append(param)
+    
+    with open(log_dir, mode='a') as f:
+        f.write(f'Param groups = {json.dumps(parameter_group_names, indent=2)}\n')
+    return list(parameter_group_vars.values())
+
+
+if __name__ == '__main__':
+    seed = 2425
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    log_dir = 'partseg/pointmeta_partseg.log'
+    # logging.basicConfig(filename=log_dir, format='%(message)s', level=logging.INFO)
+    # with open(log_dir, mode='a') as f:
+    #     f.write(f'random seed {seed}\n')
+
+    # train_aug = Compose([PointCloudScaling(0.8, 1.2),
+    #                      PointCloudCenterAndNormalize(),
+    #                      PointCloudJitter(0.001, 0.005),
+    #                      NormalDrop(0.2)])
+    # train_dataset = ShapeNet('/home/lindi/chenhr/threed/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
+    #                          split='train', npoints=2048, transforms=train_aug)
+    val_aug = Compose([PointCloudCenterAndNormalize()])
+    # val_dataset = ShapeNet('/home/lindi/chenhr/threed/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
+    #                         split='test', npoints=2048, transforms=val_aug)
+
+    # train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8)
+    # val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=8)
+
+    device = 'cuda:7'
+
+    pointmeta = PointMeta(50).to(device)
+    loss_fn = PolyFocalLoss(2.0, 0.25, 1.0)
+    metric_acc = Accuracy(device=device)
+    
+    # 配置不同的weight decay
+    # parameter_group = get_parameter_groups(pointmeta, weight_decay=1e-4, log_dir=log_dir)
+    # optimizer = torch.optim.AdamW(parameter_group, lr=1e-3)
+    # lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [140, 180], 0.1)
+
+    epochs = 200
+    show_gap = 1
+    save_path = 'partseg/pointmeta_partseg.pth'
+    # for i in range(epochs):
+    #     train_loop(train_dataloader, pointmeta, loss_fn, metric_acc, optimizer, device, i, epochs, show_gap, 1)
+    #     val_loop(val_dataloader, pointmeta, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir)
+    #     lr_scheduler.step()
+    
+    # voting test
+    test_dataset = ShapeNet('/home/lindi/chenhr/threed/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
+                            split='test', npoints=2048, transforms=val_aug)
+    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=8)
+    voting_test(test_dataloader, pointmeta, loss_fn, device, save_path, log_dir, 10)

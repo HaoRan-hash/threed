@@ -1,0 +1,10 @@
+.vscode/*
+*.pyc
+*.log
+*.pth
+*.txt
+*.png
+*.egg-info
+dist
+build
+*.egg
