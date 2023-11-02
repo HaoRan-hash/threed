@@ -225,7 +225,7 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
                     for rot in rotations:
                         angle = math.pi * rot
                         cos, sin = math.cos(angle), math.sin(angle)
-                        rotmat = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]])
+                        rotmat = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]], device=device)
                         temp_pos, temp_color, temp_normal = test_transform(torch.matmul(cur_pos, rotmat) * scale, 
                                                                            cur_color, torch.matmul(cur_normal, rotmat))
                         temp_pos = temp_pos - temp_pos.min(dim=1)[0]
@@ -359,5 +359,6 @@ if __name__ == '__main__':
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, sampler=test_sampler)
     else:
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, shuffle=False)
-    test_entire_room(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
+    # test_entire_room(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
+    voting_test(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
     
