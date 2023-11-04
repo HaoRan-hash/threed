@@ -240,6 +240,7 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
             
             loss += loss_fn(all_pred, y)
             cm.update((all_pred, y))
+            dist.barrier()
         
     loss = loss / steps
     # 计算oa和macc
