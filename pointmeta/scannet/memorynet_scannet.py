@@ -16,6 +16,7 @@ from data_aug import *
 from data_aug_tensor import *
 from model_memory import PointMeta_Memory
 from lovasz_loss import lovasz_softmax
+import math
 
 
 def train_loop(dataloader, model, loss_fn, optimizer, device, 
@@ -181,13 +182,14 @@ def test_entire_room(dataloader, test_transform, model, loss_fn, device, model_p
         print(f'test_loss={loss:.4f}, test_miou={miou:.4f}, test_oa={oa:.4f}, test_macc={macc:.4f}')
 
 
-def multi_scale_test(dataloader, test_transform, model, loss_fn, device, model_path, log_dir, rank):
+def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, log_dir, rank):
     model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
     model.eval()
     steps = len(dataloader)
     idx_to_class = dataloader.dataset.idx_to_class
     loss = 0
-    scales = [0.9, 1.0, 1.1]
+    scales = [0.95, 1.0, 1.05]
+    rotations = [0, 0.5, 1, 1.5]
     
     if rank == 0:
         pbar = tqdm(dataloader)
@@ -217,14 +219,21 @@ def multi_scale_test(dataloader, test_transform, model, loss_fn, device, model_p
                 cur_pos = pos[:, idx_select, :]
                 cur_color = color[:, idx_select, :]
                 cur_normal = normal[:, idx_select, :]
+                cur_pos = cur_pos - cur_pos.min(dim=1)[0]
                 
                 cum_temp = 0
                 for scale in scales:
-                    temp1, temp2, temp3 = test_transform(cur_pos * scale, cur_color, cur_normal)
-                    with torch.cuda.amp.autocast():
-                        cur_pred, _, _ = model(temp1, temp2, temp3)
-                    cur_pred = cur_pred.to(dtype=torch.float32)
-                    cum_temp += cur_pred
+                    for rot in rotations:
+                        angle = math.pi * rot
+                        cos, sin = math.cos(angle), math.sin(angle)
+                        rotmat = torch.tensor([[cos, sin, 0], [-sin, cos, 0], [0, 0, 1]], device=device)
+                        temp_pos, temp_color, temp_normal = test_transform(torch.matmul(cur_pos, rotmat) * scale, 
+                                                                           cur_color, torch.matmul(cur_normal, rotmat))
+                        temp_pos = temp_pos - temp_pos.min(dim=1)[0]
+                        with torch.cuda.amp.autocast():
+                            cur_pred, _, _ = model(temp_pos, temp_color, temp_normal)
+                        cur_pred = cur_pred.to(dtype=torch.float32)
+                        cum_temp += cur_pred
                 cum_temp = cum_temp / len(scales)
                 all_pred[:, :, idx_select] += cum_temp
             
