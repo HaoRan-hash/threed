@@ -1,4 +1,7 @@
 import numpy as np
+import scipy
+import random
+import torch
 
 
 class Compose:
@@ -8,10 +11,10 @@ class Compose:
         """
         self.transforms = transforms
 
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         for transform in self.transforms:
-            pos, x = transform(pos, x)
-        return pos, x
+            pos, color, normal = transform(pos, color, normal)
+        return pos, color, normal
 
 
 class ColorContrast:
@@ -19,28 +22,36 @@ class ColorContrast:
         self.p = p
         self.blend_factor = blend_factor
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         if np.random.rand() < self.p:
-            low = x.min(axis=0, keepdims=True)
-            high = x.max(axis=0, keepdims=True)
-            contrast_x = (x - low) * (255 / (high - low))
+            low = color.min(axis=0, keepdims=True)
+            high = color.max(axis=0, keepdims=True)
+            contrast_color = (color - low) * (255 / (high - low))
             
             blend_factor = np.random.rand() if not self.blend_factor else self.blend_factor
-            x = blend_factor * contrast_x + (1 - blend_factor) * x
-        return pos, x
+            color = blend_factor * contrast_color + (1 - blend_factor) * color
+        return pos, color, normal
 
 
 class PointCloudScaling:
-    def __init__(self, ratio_low, ratio_high, anisotropic=True):
+    def __init__(self, ratio_low, ratio_high, anisotropic=True, mirror=[-1, -1, -1]):
+        """
+        mirror: the possibility of mirroring. set to a negative value to not mirror
+        """
         self.ratio_low = ratio_low
         self.ratio_high = ratio_high
         self.anisotropic = anisotropic
+        self.mirror = np.array(mirror)
+        self.use_mirroring = np.sum(self.mirror > 0) != 0
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         scale_ratio = np.random.uniform(self.ratio_low, self.ratio_high, (3 if self.anisotropic else 1, ))
+        if self.use_mirroring:
+            mirror = (np.random.rand(3) > self.mirror).astype(np.float32) * 2 - 1
+            scale_ratio = scale_ratio * mirror
         pos = pos * scale_ratio
         
-        return pos, x
+        return pos, color, normal
 
 
 class PointCloudRotation_Y:
@@ -51,7 +62,7 @@ class PointCloudRotation_Y:
         self.angle = angle * np.pi
         self.has_normal = has_normal
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         angle = np.random.uniform(low=(-self.angle), high=self.angle, size=(1,))
         angle_cos = np.cos(angle)
         angle_sin = np.sin(angle)
@@ -62,19 +73,20 @@ class PointCloudRotation_Y:
         pos = np.dot(pos, rotation_matrix)
         
         if self.has_normal:
-            x[:, 0:3] = np.dot(x[:, 0:3], rotation_matrix)
+            normal = np.dot(normal, rotation_matrix)
 
-        return pos, x
+        return pos, color, normal
 
 
 class PointCloudRotation_Z:
-    def __init__(self, angle):
+    def __init__(self, angle, has_normal):
         """
         angle is a float in (0, 1]
         """
         self.angle = angle * np.pi
+        self.has_normal = has_normal
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         angle = np.random.uniform(low=(-self.angle), high=self.angle, size=(1,))
         angle_cos = np.cos(angle)
         angle_sin = np.sin(angle)
@@ -84,18 +96,21 @@ class PointCloudRotation_Z:
                                     [0, 0, 1]])
         pos = np.dot(pos, rotation_matrix)
         
-        return pos, x
+        if self.has_normal:
+            normal = np.dot(normal, rotation_matrix)
+        
+        return pos, color, normal
         
 
 class PointCloudFloorCentering:
     def __init__(self):
         pass
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         pos = pos - pos.mean(axis=0, keepdims=True)
         pos[:, 2] = pos[:, 2] - pos[:, 2].min()
         
-        return pos, x
+        return pos, color, normal
 
 
 class PointCloudCenterAndNormalize:
@@ -114,28 +129,28 @@ class PointCloudCenterAndNormalize:
         pos = pos / max_dis
         
         return pos, x
-
+        
 
 class PointCloudJitter:
     def __init__(self, sigma, clip):
         self.sigma = sigma
         self.clip = clip
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         noise = np.clip(np.random.randn(len(pos), 3) * self.sigma, -self.clip, self.clip)
         pos = pos + noise
         
-        return pos, x
+        return pos, color, normal
     
 
 class ColorDrop:
     def __init__(self, p):
         self.p = p
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         if np.random.rand() < self.p:
-            x[:, :] = 0
-        return pos, x
+            color[:, :] = 0
+        return pos, color, normal
 
 
 class ColorNormalize:
@@ -143,18 +158,62 @@ class ColorNormalize:
         self.mean = mean
         self.std = std
     
-    def __call__(self, pos, x):
-        x = x / 255
-        x = (x - self.mean) / self.std
+    def __call__(self, pos, color, normal):
+        color = color / 255
+        color = (color - self.mean) / self.std
         
-        return pos, x
+        return pos, color, normal
 
 
 class NormalDrop:
     def __init__(self, p):
         self.p = p
         
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         if np.random.rand() < self.p:
-            x[:, 0:3] = 0
-        return pos, x
+            normal[:, :] = 0
+        return pos, color, normal
+
+
+class ElasticDistortion():
+    def __init__(self, distortion_params=None):
+        self.distortion_params = [[0.2, 0.4], [0.8, 1.6]] if distortion_params is None else distortion_params
+
+    @staticmethod
+    def elastic_distortion(coords, granularity, magnitude):
+        """
+        Apply elastic distortion on sparse coordinate space.
+        pointcloud: numpy array of (number of points, at least 3 spatial dims)
+        granularity: size of the noise grid (in same scale[m/cm] as the voxel grid)
+        magnitude: noise multiplier
+        """
+        blurx = np.ones((3, 1, 1, 1)).astype('float32') / 3
+        blury = np.ones((1, 3, 1, 1)).astype('float32') / 3
+        blurz = np.ones((1, 1, 3, 1)).astype('float32') / 3
+        coords_min = coords.min(0)
+
+        # Create Gaussian noise tensor of the size given by granularity.
+        noise_dim = ((coords - coords_min).max(0) // granularity).astype(int) + 3
+        noise = np.random.randn(*noise_dim, 3).astype(np.float32)
+
+        # Smoothing.
+        for _ in range(2):
+            noise = scipy.ndimage.filters.convolve(noise, blurx, mode='constant', cval=0)
+            noise = scipy.ndimage.filters.convolve(noise, blury, mode='constant', cval=0)
+            noise = scipy.ndimage.filters.convolve(noise, blurz, mode='constant', cval=0)
+
+        # Trilinear interpolate noise filters for each spatial dimensions.
+        ax = [
+            np.linspace(d_min, d_max, d)
+            for d_min, d_max, d in zip(coords_min - granularity, coords_min + granularity *
+                                       (noise_dim - 2), noise_dim)
+        ]
+        interp = scipy.interpolate.RegularGridInterpolator(ax, noise, bounds_error=False, fill_value=0)
+        coords += interp(coords) * magnitude
+        return coords
+
+    def __call__(self, pos, color, normal):
+        if random.random() < 0.95:
+            for granularity, magnitude in self.distortion_params:
+                pos = self.elastic_distortion(pos, granularity, magnitude)
+        return pos, color, normal

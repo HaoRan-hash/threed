@@ -3,6 +3,8 @@ import os
 from torch.utils.data import Dataset
 import json
 import pickle
+from pathlib import Path
+from data_aug import *
 
 
 class ShapeNet(Dataset):
@@ -157,3 +159,106 @@ class S3dis(Dataset):
         
         pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
         return pos, x, y
+
+
+class Scannet(Dataset):
+    def __init__(self, root, split, loop, npoints=64000, voxel_size=0.02, transforms=None):
+        super(Scannet, self).__init__()
+        self.root = Path(root)
+        with open('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_train.txt', 'r') as file:
+            scan_train = [line.strip() for line in file.readlines()]
+        with open('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_val.txt', 'r') as file:
+            scan_val = [line.strip() for line in file.readlines()]
+        self.split = split
+        if split == 'train':
+            self.room_list = [self.root / f"{p}.pt" for p in scan_train]
+        elif split == 'val' or split == 'val_test':
+            self.room_list = [self.root / f"{p}.pt" for p in scan_val]
+        elif split == 'trainval':
+            scan_tarinval = scan_train + scan_val
+            self.room_list = [self.root / f"{p}.pt" for p in scan_tarinval]
+        else:
+            raise ValueError(f'Not support {split} type')
+
+        self.loop = loop
+        self.npoints = npoints
+        self.voxel_size = voxel_size
+        self.transforms = transforms
+        self.idx_to_class = {0: 'wall', 1: 'floor', 2: 'cabinet', 3: 'bed', 4: 'chair', 
+                5: 'sofa', 6: 'table', 7: 'door', 8: 'window', 9: 'bookshelf', 10: 'picture', 11: 'counter', 12: 'desk',
+                13: 'curtain', 14: 'refrigerator', 15: 'shower curtain', 16: 'toilet', 17: 'sink', 18: 'bathtub', 19: 'otherfurniture'}
+    
+    def __len__(self):
+        return len(self.room_list) * self.loop
+    
+    def fnv_hash_vec(self, arr):
+        """
+        FNV64-1A
+        """
+        assert arr.ndim == 2
+        # Floor first for negative coordinates
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * \
+            np.ones(arr.shape[0], dtype=np.uint64)
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
+
+    def voxel_grid_sampling(self, pos):
+        """
+        pos.shape = (n, 3)
+        """
+        voxel_indices = np.floor(pos / self.voxel_size)
+        
+        voxel_hash = self.fnv_hash_vec(voxel_indices)
+        sort_idx = voxel_hash.argsort()
+        hash_sort = voxel_hash[sort_idx]
+        
+        _, counts = np.unique(hash_sort, return_counts=True)
+        if self.split == 'val_test':   # test时需要的东西和train，val时不同
+            return sort_idx, counts
+        
+        idx_select = np.cumsum(np.insert(counts, 0, 0)[0:-1]) + np.random.randint(0, counts.max(), counts.size) % counts
+        return sort_idx[idx_select]
+    
+    def __getitem__(self, index):
+        room = self.room_list[index % len(self.room_list)]
+        pos, color, normal, y = torch.load(room)   # color的范围是[0, 255]
+        pos, color, normal, y = pos.numpy(), color.numpy(), normal.numpy(), y.numpy()
+        
+        if self.transforms:
+            pos, color, normal = self.transforms(pos, color, normal)
+        pos = pos - pos.min(0)
+        
+        if self.split == 'val_test':
+            sort_idx, counts = self.voxel_grid_sampling(pos)
+            pos, color, normal, y = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32), y.astype(np.int64)
+            return pos, color, normal, y, sort_idx, counts
+
+        # train, val的流程
+        sample_indices = self.voxel_grid_sampling(pos)
+        pos, color, normal, y = pos[sample_indices], color[sample_indices], normal[sample_indices], y[sample_indices]
+        
+        # 是否指定了npoints
+        if self.npoints:
+            n = len(sample_indices)
+            if n > self.npoints:
+                init_idx = np.random.randint(n)
+                crop_indices = np.argsort(np.sum(np.square(pos - pos[init_idx]), 1))[:self.npoints]
+            elif n < self.npoints:
+                temp = np.arange(n)
+                pad_choice = np.random.choice(n, self.npoints - n)
+                crop_indices = np.hstack([temp, temp[pad_choice]])
+            else:
+                crop_indices = np.arange(n)
+            
+            # 打乱
+            np.random.shuffle(crop_indices)
+        
+            pos, color, normal, y = pos[crop_indices], color[crop_indices], normal[crop_indices], y[crop_indices]
+        pos = pos - pos.min(0)
+        
+        pos, color, normal, y = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32), y.astype(np.int64)
+        return pos, color, normal, y
