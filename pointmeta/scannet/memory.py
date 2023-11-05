@@ -10,7 +10,7 @@ from utils_func import SemanticAwareAttention
 
 
 class Memory(nn.Module):
-    def __init__(self, num_class, length, store_channels, query_channels, base_miu=0.1, end_miu=0.001):
+    def __init__(self, num_class, length, store_channels, query_channels, base_miu=0.1, end_miu=0.001, use_ddp=False):
         super(Memory, self).__init__()
         self.num_class = num_class
         self.length = length
@@ -20,6 +20,7 @@ class Memory(nn.Module):
         self.end_miu = end_miu
         self.poly_power = 0.9
         self.tao = 0.1
+        self.use_ddp = use_ddp
         self.register_buffer('memory', torch.zeros((num_class, length, store_channels)))
         self.attention = SemanticAwareAttention(query_channels, store_channels, store_channels)
         self.register_buffer('cur_occupy', torch.zeros((num_class, )))
@@ -31,19 +32,20 @@ class Memory(nn.Module):
                                  nn.Dropout(0.1),
                                  nn.Conv1d(query_channels*4, query_channels, 1))
         
-        self.proj_mlp = nn.Sequential(nn.Conv1d(query_channels, store_channels, 1, bias=False),
-                                      nn.BatchNorm1d(store_channels),
-                                      nn.ReLU(True),
-                                      nn.Conv1d(store_channels, store_channels, 1, bias=False),
-                                      nn.BatchNorm1d(store_channels),
-                                      nn.ReLU(True),
-                                      nn.Conv1d(store_channels, store_channels, 1))
+        # self.proj_mlp = nn.Sequential(nn.Conv1d(query_channels, store_channels, 1, bias=False),
+        #                               nn.BatchNorm1d(store_channels),
+        #                               nn.ReLU(True),
+        #                               nn.Conv1d(store_channels, store_channels, 1, bias=False),
+        #                               nn.BatchNorm1d(store_channels),
+        #                               nn.ReLU(True),
+        #                               nn.Conv1d(store_channels, store_channels, 1))
     
-    def is_full(self):
-        res = True
+    def get_not_full_num(self):
+        not_full_num = 0
         for i in range(self.num_class):
-            res = (res and (self.cur_occupy[i] == self.length))
-        return res
+            if self.cur_occupy[i] != self.length:
+                not_full_num += 1
+        return not_full_num
     
     @torch.no_grad()
     def update(self, features, gts, coarse_pred, epoch_ratio):
@@ -83,12 +85,13 @@ class Memory(nn.Module):
                 else:
                     self.memory[i] = cur_features[choice] * cur_miu + self.memory[i] * (1 - cur_miu)
         # 做多卡同步
-        dist.barrier()
-        dist.all_reduce(self.memory, op=dist.ReduceOp.SUM)
-        dist.all_reduce(self.cur_occupy, op=dist.ReduceOp.MAX)
-        dist.barrier()
-        print(int(os.environ['WORLD_SIZE']))   # debug
-        self.memory = self.memory / int(os.environ['WORLD_SIZE'])
+        if self.use_ddp:
+            dist.barrier()
+            dist.all_reduce(self.memory, op=dist.ReduceOp.SUM)
+            dist.all_reduce(self.cur_occupy, op=dist.ReduceOp.MAX)
+            dist.barrier()
+            # print(f'device num: {int(os.environ["WORLD_SIZE"])}')   # debug
+            self.memory = self.memory / int(os.environ['WORLD_SIZE'])
     
     def forward(self, features, coarse_pred, gts):
         """
@@ -98,10 +101,11 @@ class Memory(nn.Module):
         """
         b = features.shape[0]
         aug_coef, loss_coef = 1, 1
-        if self.training and (not self.is_full()):
+        not_full_num = self.get_not_full_num()
+        if self.training and (not_full_num != 0):
             aug_coef = 0
             loss_coef = 0
-        print(aug_coef, loss_coef)   # debug
+        # print(f'aug_coef={aug_coef}, loss_coef={loss_coef}, not full num={not_full_num}')   # debug
         
         memory_features = self.memory.mean(dim=1).unsqueeze(dim=0).expand(b, -1, -1)
         memory_features = F.normalize(memory_features, dim=-1)

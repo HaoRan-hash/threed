@@ -38,7 +38,7 @@ def train_loop(dataloader, model, loss_fn, optimizer, device,
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             y_pred, coarse_seg_loss, contrast_loss = model(pos, color, normal, y, cur_epoch/total_epoch)
-            loss = loss_fn(y_pred, y) + coarse_seg_loss + contrast_loss + lovasz_softmax(y_pred.softmax(dim=1), y, ignore=20)
+            loss = loss_fn(y_pred, y) + coarse_seg_loss + contrast_loss + 3 * lovasz_softmax(y_pred.softmax(dim=1), y, ignore=20)
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -241,6 +241,7 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
             
             loss += loss_fn(all_pred, y)
             cm.update((all_pred, y))
+            dist.barrier()
         
     loss = loss / steps
     # 计算oa和macc
@@ -302,7 +303,7 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    log_dir = 'scannet/logs/pointmeta_scannet_norm.log'
+    log_dir = 'scannet/logs/memorynet_scannet_norm.log'
     # logging.basicConfig(filename=log_dir, format='%(message)s', level=logging.INFO)
     if rank == 0:
         with open(log_dir, mode='a') as f:
@@ -331,7 +332,7 @@ if __name__ == '__main__':
     device = f'cuda:{rank}'
     torch.cuda.set_device(device)
 
-    pointmeta = PointMeta_Memory(20, 4, 32, [4, 8, 4, 4]).to(device)
+    pointmeta = PointMeta_Memory(20, 4, 32, [4, 8, 4, 4], args.use_ddp).to(device)
     if args.use_ddp:
         pointmeta = nn.SyncBatchNorm.convert_sync_batchnorm(pointmeta)
         pointmeta = nn.parallel.DistributedDataParallel(pointmeta, device_ids=[rank], output_device=rank)
@@ -344,7 +345,7 @@ if __name__ == '__main__':
 
     epochs = 100
     show_gap = 1
-    save_path = 'scannet/checkpoints/pointmeta_scannet_norm.pth'
+    save_path = 'scannet/checkpoints/memorynet_scannet_norm.pth'
     for i in range(epochs):
         if args.use_ddp:
             train_sampler.set_epoch(i)
@@ -361,5 +362,5 @@ if __name__ == '__main__':
     else:
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, shuffle=False)
     test_entire_room(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
-    multi_scale_test(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
+    voting_test(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
     

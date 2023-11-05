@@ -197,7 +197,7 @@ class StageBlocks(nn.Module):
 
 
 class PointMeta_Memory(nn.Module):
-    def __init__(self, num_class, stride, k, InvRes_num_list):
+    def __init__(self, num_class, stride, k, InvRes_num_list, use_ddp):
         super().__init__()
         self.in_linear = nn.Linear(7, 64)
         self.stage1 = StageBlocks(stride, 0.05, k, 64, 128, InvRes_num_list[0])
@@ -211,7 +211,7 @@ class PointMeta_Memory(nn.Module):
                                         nn.BatchNorm1d(512),
                                         nn.ReLU(inplace=True),
                                         nn.Conv1d(512, num_class, kernel_size=1))
-        self.memory1 = Memory(num_class, 128, 512, 512)
+        self.memory1 = Memory(num_class, 128, 512, 512, use_ddp=use_ddp)
         
         self.fp2 = PointFeaturePropagationLayer(512+256, [256, 256])
         self.pe_gen2 = PEGenerator(256)
@@ -219,7 +219,7 @@ class PointMeta_Memory(nn.Module):
                                         nn.BatchNorm1d(256),
                                         nn.ReLU(inplace=True),
                                         nn.Conv1d(256, num_class, kernel_size=1))
-        self.memory2 = Memory(num_class, 128, 256, 256)
+        self.memory2 = Memory(num_class, 128, 256, 256, use_ddp=use_ddp)
 
         self.fp3 = PointFeaturePropagationLayer(256+128, [128, 128])
         self.pe_gen3 = PEGenerator(128)
@@ -227,7 +227,7 @@ class PointMeta_Memory(nn.Module):
                                         nn.BatchNorm1d(128),
                                         nn.ReLU(inplace=True),
                                         nn.Conv1d(128, num_class, kernel_size=1))
-        self.memory3 = Memory(num_class, 128, 128, 128)
+        self.memory3 = Memory(num_class, 128, 128, 128, use_ddp=use_ddp)
         
         self.fp4 = PointFeaturePropagationLayer(128+64, [64, 64])
         
@@ -261,7 +261,7 @@ class PointMeta_Memory(nn.Module):
         if self.training:
             coarse_seg_loss1 = F.cross_entropy(coarse_pred1, y3, label_smoothing=0.2, ignore_index=20)
             self.memory1.update(x3, y3, coarse_pred1, epoch_ratio)
-        x3, _ = self.memory1(x3, coarse_pred1)
+        x3, _ = self.memory1(x3, coarse_pred1, None)
         
         x2 = self.fp2(pos2, x2, pos3, x3)
         # 给x2加上pe
@@ -271,7 +271,7 @@ class PointMeta_Memory(nn.Module):
         if self.training:
             coarse_seg_loss2 = F.cross_entropy(coarse_pred2, y2, label_smoothing=0.2, ignore_index=20)
             self.memory2.update(x2, y2, coarse_pred2, epoch_ratio)
-        x2, _ = self.memory2(x2, coarse_pred2)
+        x2, _ = self.memory2(x2, coarse_pred2, None)
         
         x1 = self.fp3(pos1, x1, pos2, x2)
         # 给x1加上pe
