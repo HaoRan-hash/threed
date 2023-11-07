@@ -331,14 +331,14 @@ if __name__ == '__main__':
     device = f'cuda:{rank}'
     torch.cuda.set_device(device)
 
-    pointmeta = PointNeXt(20, 4, 32, [3, 6, 3, 3]).to(device)
+    pointnext = PointNeXt(20, 4, 32, [3, 6, 3, 3]).to(device)
     if args.use_ddp:
-        pointmeta = nn.SyncBatchNorm.convert_sync_batchnorm(pointmeta)
-        pointmeta = nn.parallel.DistributedDataParallel(pointmeta, device_ids=[rank], output_device=rank)
+        pointnext = nn.SyncBatchNorm.convert_sync_batchnorm(pointnext)
+        pointnext = nn.parallel.DistributedDataParallel(pointnext, device_ids=[rank], output_device=rank)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.2, ignore_index=20)
     
     # 配置不同的weight decay
-    parameter_group = get_parameter_groups(pointmeta, weight_decay=1e-4, log_dir=log_dir)
+    parameter_group = get_parameter_groups(pointnext, weight_decay=1e-4, log_dir=log_dir)
     optimizer = torch.optim.AdamW(parameter_group, lr=0.001)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [70, 90], 0.1)
 
@@ -348,8 +348,8 @@ if __name__ == '__main__':
     for i in range(epochs):
         if args.use_ddp:
             train_sampler.set_epoch(i)
-        train_loop(train_dataloader, pointmeta, loss_fn, optimizer, device, i, epochs, show_gap, 1, rank)
-        val_loop(val_dataloader, pointmeta, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir, rank)
+        train_loop(train_dataloader, pointnext, loss_fn, optimizer, device, i, epochs, show_gap, 1, rank)
+        val_loop(val_dataloader, pointnext, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir, rank)
         lr_scheduler.step()
     
     # test entire room
@@ -360,6 +360,6 @@ if __name__ == '__main__':
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, sampler=test_sampler)
     else:
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, shuffle=False)
-    # test_entire_room(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
-    voting_test(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
+    # test_entire_room(test_dataloader, test_aug, pointnext, loss_fn, device, save_path, log_dir, rank)
+    voting_test(test_dataloader, test_aug, pointnext, loss_fn, device, save_path, log_dir, rank)
     

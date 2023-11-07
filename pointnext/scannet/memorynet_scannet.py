@@ -262,7 +262,7 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
         print(f'test_loss={loss:.4f}, test_miou={miou:.4f}, test_oa={oa:.4f}, test_macc={macc:.4f}')
 
 
-def get_parameter_groups(model, weight_decay, log_dir):
+def get_parameter_groups(model, weight_decay, log_dir, rank):
     parameter_group_names = {'decay': {'weight_decay': weight_decay,
                                        'params': []},
                              'no_decay': {'weight_decay': 0,
@@ -284,8 +284,9 @@ def get_parameter_groups(model, weight_decay, log_dir):
         parameter_group_names[group_name]['params'].append(name)
         parameter_group_vars[group_name]['params'].append(param)
     
-    with open(log_dir, mode='a') as f:
-        f.write(f'Param groups = {json.dumps(parameter_group_names, indent=2)}\n')
+    if rank == 0:
+        with open(log_dir, mode='a') as f:
+            f.write(f'Param groups = {json.dumps(parameter_group_names, indent=2)}\n')
     return list(parameter_group_vars.values())
 
 
@@ -332,14 +333,14 @@ if __name__ == '__main__':
     device = f'cuda:{rank}'
     torch.cuda.set_device(device)
 
-    pointmeta = PointNeXt_Memory(20, 4, 32, [3, 6, 3, 3], args.use_ddp).to(device)
+    pointnext = PointNeXt_Memory(20, 4, 32, [3, 6, 3, 3], args.use_ddp).to(device)
     if args.use_ddp:
-        pointmeta = nn.SyncBatchNorm.convert_sync_batchnorm(pointmeta)
-        pointmeta = nn.parallel.DistributedDataParallel(pointmeta, device_ids=[rank], output_device=rank)
+        pointnext = nn.SyncBatchNorm.convert_sync_batchnorm(pointnext)
+        pointnext = nn.parallel.DistributedDataParallel(pointnext, device_ids=[rank], output_device=rank)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.2, ignore_index=20)
     
     # 配置不同的weight decay
-    parameter_group = get_parameter_groups(pointmeta, weight_decay=1e-4, log_dir=log_dir)
+    parameter_group = get_parameter_groups(pointnext, weight_decay=1e-4, log_dir=log_dir, rank=rank)
     optimizer = torch.optim.AdamW(parameter_group, lr=0.001)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [70, 90], 0.1)
 
@@ -349,8 +350,8 @@ if __name__ == '__main__':
     for i in range(epochs):
         if args.use_ddp:
             train_sampler.set_epoch(i)
-        train_loop(train_dataloader, pointmeta, loss_fn, optimizer, device, i, epochs, show_gap, 1, rank)
-        val_loop(val_dataloader, pointmeta, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir, rank)
+        train_loop(train_dataloader, pointnext, loss_fn, optimizer, device, i, epochs, show_gap, 1, rank)
+        val_loop(val_dataloader, pointnext, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir, rank)
         lr_scheduler.step()
     
     # test entire room
@@ -361,6 +362,6 @@ if __name__ == '__main__':
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, sampler=test_sampler)
     else:
         test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, shuffle=False)
-    test_entire_room(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
-    voting_test(test_dataloader, test_aug, pointmeta, loss_fn, device, save_path, log_dir, rank)
+    test_entire_room(test_dataloader, test_aug, pointnext, loss_fn, device, save_path, log_dir, rank)
+    voting_test(test_dataloader, test_aug, pointnext, loss_fn, device, save_path, log_dir, rank)
     
