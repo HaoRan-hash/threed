@@ -262,3 +262,70 @@ class Scannet(Dataset):
         
         pos, color, normal, y = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32), y.astype(np.int64)
         return pos, color, normal, y
+
+
+class Scannet_Test(Dataset):
+    def __init__(self, root, loop, npoints=64000, voxel_size=0.02, transforms=None):
+        super().__init__()
+        self.root = root
+        self.room_list = list(Path(root).iterdir())
+        self.loop = loop
+        self.npoints = npoints
+        self.voxel_size = voxel_size
+        self.transforms = transforms
+        self.idx_to_class = {0: 'wall', 1: 'floor', 2: 'cabinet', 3: 'bed', 4: 'chair', 
+                5: 'sofa', 6: 'table', 7: 'door', 8: 'window', 9: 'bookshelf', 10: 'picture', 11: 'counter', 12: 'desk',
+                13: 'curtain', 14: 'refrigerator', 15: 'shower curtain', 16: 'toilet', 17: 'sink', 18: 'bathtub', 19: 'otherfurniture'}
+    
+    def __len__(self):
+        return len(self.room_list) * self.loop
+    
+    def fnv_hash_vec(self, arr):
+        """
+        FNV64-1A
+        """
+        assert arr.ndim == 2
+        # Floor first for negative coordinates
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * \
+            np.ones(arr.shape[0], dtype=np.uint64)
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
+
+    def voxel_grid_sampling(self, pos):
+        """
+        pos.shape = (n, 3)
+        """
+        voxel_indices = np.floor(pos / self.voxel_size)
+        
+        voxel_hash = self.fnv_hash_vec(voxel_indices)
+        sort_idx = voxel_hash.argsort()
+        hash_sort = voxel_hash[sort_idx]
+        
+        _, counts = np.unique(hash_sort, return_counts=True)
+        return sort_idx, counts
+    
+    def __getitem__(self, index):
+        room = self.room_list[index % len(self.room_list)]
+        pos, color, normal = torch.load(room)   # color的范围是[0, 255]
+        pos, color, normal = pos.numpy(), color.numpy(), normal.numpy()
+        
+        if self.transforms:
+            pos, color, normal = self.transforms(pos, color, normal)
+        pos = pos - pos.min(0)
+        
+        sort_idx, counts = self.voxel_grid_sampling(pos)
+        pos, color, normal = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32)
+        return pos, color, normal, sort_idx, counts, room
+
+
+def scan_test_collate_fn(batch):
+    pos, color, normal, sort_idx, counts, name = batch[0]
+    pos = torch.as_tensor(pos).unsqueeze(dim=0)
+    color = torch.as_tensor(color).unsqueeze(dim=0)
+    normal = torch.as_tensor(normal).unsqueeze(dim=0)
+    
+    return pos, color, normal, sort_idx, counts, name
