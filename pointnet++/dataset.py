@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 import json
 import pickle
 import torch
+from pathlib import Path
 
 
 class ShapeNet(Dataset):
@@ -163,8 +164,22 @@ class S3dis(Dataset):
 class Scannet(Dataset):
     def __init__(self, root, split, loop, npoints=64000, voxel_size=0.02, transforms=None):
         super(Scannet, self).__init__()
-        self.root = root
+        self.root = Path(root)
+        with open('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_train.txt', 'r') as file:
+            scan_train = [line.strip() for line in file.readlines()]
+        with open('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_val.txt', 'r') as file:
+            scan_val = [line.strip() for line in file.readlines()]
         self.split = split
+        if split == 'train':
+            self.room_list = [self.root / f"{p}.pt" for p in scan_train]
+        elif split == 'val' or split == 'val_test':
+            self.room_list = [self.root / f"{p}.pt" for p in scan_val]
+        elif split == 'trainval':
+            scan_tarinval = scan_train + scan_val
+            self.room_list = [self.root / f"{p}.pt" for p in scan_tarinval]
+        else:
+            raise ValueError(f'Not support {split} type')
+
         self.loop = loop
         self.npoints = npoints
         self.voxel_size = voxel_size
@@ -172,13 +187,6 @@ class Scannet(Dataset):
         self.idx_to_class = {0: 'wall', 1: 'floor', 2: 'cabinet', 3: 'bed', 4: 'chair', 
                 5: 'sofa', 6: 'table', 7: 'door', 8: 'window', 9: 'bookshelf', 10: 'picture', 11: 'counter', 12: 'desk',
                 13: 'curtain', 14: 'refrigerator', 15: 'shower curtain', 16: 'toilet', 17: 'sink', 18: 'bathtub', 19: 'otherfurniture'}
-
-        if split == 'train' or split == 'val':
-            self.room_list = os.listdir(os.path.join(self.root, split))
-            self.room_list = [os.path.join(split, room) for room in self.room_list]
-        elif split == 'test':
-            self.room_list = os.listdir(os.path.join(self.root, 'val'))
-            self.room_list = [os.path.join('val', room) for room in self.room_list]
     
     def __len__(self):
         return len(self.room_list) * self.loop
@@ -209,29 +217,29 @@ class Scannet(Dataset):
         hash_sort = voxel_hash[sort_idx]
         
         _, counts = np.unique(hash_sort, return_counts=True)
-        if self.split == 'test':   # test时需要的东西和train，val时不同
+        if self.split == 'val_test':   # test时需要的东西和train，val时不同
             return sort_idx, counts
         
         idx_select = np.cumsum(np.insert(counts, 0, 0)[0:-1]) + np.random.randint(0, counts.max(), counts.size) % counts
         return sort_idx[idx_select]
     
     def __getitem__(self, index):
-        room = os.path.join(self.root, self.room_list[index % len(self.room_list)])
-        points = torch.load(room)
-        pos, x, y = points[0], points[1], points[2]
-        x = (x + 1) * 127.5   # [-1, 1] -> [0, 255]
+        room = self.room_list[index % len(self.room_list)]
+        pos, color, normal, y = torch.load(room)   # color的范围是[0, 255]
+        pos, color, normal, y = pos.numpy(), color.numpy(), normal.numpy(), y.numpy()
         
         if self.transforms:
-            pos, x = self.transforms(pos, x)
+            pos, color, normal = self.transforms(pos, color, normal)
+        pos = pos - pos.min(0)
         
-        if self.split == 'test':
+        if self.split == 'val_test':
             sort_idx, counts = self.voxel_grid_sampling(pos)
-            pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-            return pos, x, y, sort_idx, counts
+            pos, color, normal, y = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32), y.astype(np.int64)
+            return pos, color, normal, y, sort_idx, counts
 
         # train, val的流程
         sample_indices = self.voxel_grid_sampling(pos)
-        pos, x, y = pos[sample_indices], x[sample_indices], y[sample_indices]
+        pos, color, normal, y = pos[sample_indices], color[sample_indices], normal[sample_indices], y[sample_indices]
         
         # 是否指定了npoints
         if self.npoints:
@@ -249,7 +257,75 @@ class Scannet(Dataset):
             # 打乱
             np.random.shuffle(crop_indices)
         
-            pos, x, y = pos[crop_indices], x[crop_indices], y[crop_indices]
+            pos, color, normal, y = pos[crop_indices], color[crop_indices], normal[crop_indices], y[crop_indices]
+        pos = pos - pos.min(0)
         
-        pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-        return pos, x, y
+        pos, color, normal, y = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32), y.astype(np.int64)
+        return pos, color, normal, y
+
+
+class Scannet_Test(Dataset):
+    def __init__(self, root, loop, npoints=64000, voxel_size=0.02, transforms=None):
+        super().__init__()
+        self.root = root
+        self.room_list = list(Path(root).iterdir())
+        self.loop = loop
+        self.npoints = npoints
+        self.voxel_size = voxel_size
+        self.transforms = transforms
+        self.idx_to_class = {0: 'wall', 1: 'floor', 2: 'cabinet', 3: 'bed', 4: 'chair', 
+                5: 'sofa', 6: 'table', 7: 'door', 8: 'window', 9: 'bookshelf', 10: 'picture', 11: 'counter', 12: 'desk',
+                13: 'curtain', 14: 'refrigerator', 15: 'shower curtain', 16: 'toilet', 17: 'sink', 18: 'bathtub', 19: 'otherfurniture'}
+    
+    def __len__(self):
+        return len(self.room_list) * self.loop
+    
+    def fnv_hash_vec(self, arr):
+        """
+        FNV64-1A
+        """
+        assert arr.ndim == 2
+        # Floor first for negative coordinates
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * \
+            np.ones(arr.shape[0], dtype=np.uint64)
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
+
+    def voxel_grid_sampling(self, pos):
+        """
+        pos.shape = (n, 3)
+        """
+        voxel_indices = np.floor(pos / self.voxel_size)
+        
+        voxel_hash = self.fnv_hash_vec(voxel_indices)
+        sort_idx = voxel_hash.argsort()
+        hash_sort = voxel_hash[sort_idx]
+        
+        _, counts = np.unique(hash_sort, return_counts=True)
+        return sort_idx, counts
+    
+    def __getitem__(self, index):
+        room = self.room_list[index % len(self.room_list)]
+        pos, color, normal = torch.load(room)   # color的范围是[0, 255]
+        pos, color, normal = pos.numpy(), color.numpy(), normal.numpy()
+        
+        if self.transforms:
+            pos, color, normal = self.transforms(pos, color, normal)
+        pos = pos - pos.min(0)
+        
+        sort_idx, counts = self.voxel_grid_sampling(pos)
+        pos, color, normal = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32)
+        return pos, color, normal, sort_idx, counts, room
+
+
+def scan_test_collate_fn(batch):
+    pos, color, normal, sort_idx, counts, name = batch[0]
+    pos = torch.as_tensor(pos).unsqueeze(dim=0)
+    color = torch.as_tensor(color).unsqueeze(dim=0)
+    normal = torch.as_tensor(normal).unsqueeze(dim=0)
+    
+    return pos, color, normal, sort_idx, counts, name

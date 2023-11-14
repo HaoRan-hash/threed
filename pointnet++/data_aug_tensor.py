@@ -19,11 +19,11 @@ class ColorNormalizeTensor:
         self.mean = mean
         self.std = std
     
-    def __call__(self, pos, x):
-        x = x / 255
-        x = (x - torch.tensor(self.mean, device=x.device)) / torch.tensor(self.std, device=x.device)
+    def __call__(self, pos, color, normal):
+        color = color / 255
+        color = (color - torch.tensor(self.mean, device=color.device)) / torch.tensor(self.std, device=color.device)
         
-        return pos, x
+        return pos, color, normal
 
 
 class PointCloudScalingBatch:
@@ -32,12 +32,12 @@ class PointCloudScalingBatch:
         self.ratio_high = ratio_high
         self.anisotropic = anisotropic
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         scale_ratio = np.random.uniform(self.ratio_low, self.ratio_high, (pos.shape[0], 3 if self.anisotropic else 1))
         scale_ratio = torch.as_tensor(scale_ratio, device=pos.device, dtype=torch.float32).unsqueeze(dim=1)
         pos = pos * scale_ratio
         
-        return pos, x
+        return pos, color, normal
 
 
 def get_normal(pos):

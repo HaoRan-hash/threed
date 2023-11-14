@@ -5,17 +5,20 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from ignite.metrics import ConfusionMatrix, IoU, mIoU
+from ignite.metrics import ConfusionMatrix
 from tqdm import tqdm
 from argparse import ArgumentParser
 import json
 import sys
 sys.path.append('/mnt/Disk16T/chenhr/threed/pointnet++')
-from dataset import Scannet
+from dataset import Scannet, Scannet_Test, scan_test_collate_fn
 from data_aug import *
 from data_aug_tensor import *
-from model import Pointnet2
+from model_memory import Pointnet2_Memory
+from lovasz_loss import lovasz_softmax
 import math
+from pathlib import Path
+import datetime
 
 
 def train_loop(dataloader, model, loss_fn, optimizer, device, 
@@ -36,8 +39,8 @@ def train_loop(dataloader, model, loss_fn, optimizer, device,
         y = y.to(device)
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
-            y_pred = model(pos, color, normal)
-            loss = loss_fn(y_pred, y)
+            y_pred, coarse_seg_loss, contrast_loss = model(pos, color, normal, y, cur_epoch/total_epoch)
+            loss = loss_fn(y_pred, y) + coarse_seg_loss + contrast_loss + 3 * lovasz_softmax(y_pred.softmax(dim=1), y, ignore=20)
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -59,83 +62,24 @@ def train_loop(dataloader, model, loss_fn, optimizer, device,
             pbar.set_postfix_str(f'loss={loss:.4f}, acc={acc:.4f}')
 
 
-best_miou = 0
-best_epoch = 0
-def val_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, device, cur_epoch, path, show_gap, log_dir, rank):
-    model.eval()
-    steps = len(dataloader)
-    idx_to_class = dataloader.dataset.idx_to_class
-    loss = 0
-    
-    cm = ConfusionMatrix(20, device=device)
-    iou_fn = IoU(cm)
-    miou_fn = mIoU(cm)
-    with torch.no_grad():
-        for pos, color, normal, y in dataloader:
-            pos = pos.to(device)
-            color = color.to(device)
-            normal = normal.to(device)
-            y = y.to(device)
-            with torch.cuda.amp.autocast():
-                y_pred = model(pos, color, normal)
-                loss += loss_fn(y_pred, y)
-
-            cm.update((y_pred, y))
-            
-    loss = loss / steps
-    # 计算oa和macc
-    matrix = cm.compute()
-    oa = matrix.diag().sum() / matrix.sum()
-    oa = oa.item()
-    macc = torch.mean(matrix.diag() / matrix.sum(dim=1)).item()
-    
-    iou = iou_fn.compute()
-    miou = miou_fn.compute().item()
-
-    global best_miou, best_epoch
-    if miou >= best_miou:
-        best_miou = miou
-        best_epoch = cur_epoch
-        if rank == 0:
-            torch.save({'epoch': cur_epoch,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': lr_scheduler.state_dict(),
-                            'miou': best_miou}, path)
-
-    if rank == 0 and cur_epoch % show_gap == 0:
-        with open(log_dir, mode='a') as f:
-            f.write(f'Epoch {cur_epoch}\n\n')
-            for i in range(20):
-                f.write(f'{idx_to_class[i]}:   {iou[i]:.4f}\n')
-            f.write(f'val_loss={loss:.4f}, val_miou={miou:.4f}, val_oa={oa:.4f}, val_macc={macc:.4f}\n')
-            f.write('-------------------------------------------------------\n')
-        print(f'val_loss={loss:.4f}, val_miou={miou:.4f}, val_oa={oa:.4f}, val_macc={macc:.4f}')
-
-
-def test_entire_room(dataloader, test_transform, model, loss_fn, device, model_path, log_dir, rank):
+save_dir = Path('/mnt/Disk16T/chenhr/threed/pointnet++/scannet/save_zips/memory_novote')
+def test_entire_room(dataloader, test_transform, model, device, model_path, rank):
     model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
     model.eval()
-    steps = len(dataloader)
-    idx_to_class = dataloader.dataset.idx_to_class
-    loss = 0
     
     if rank == 0:
         pbar = tqdm(dataloader)
     else:
         pbar = dataloader
-    cm = ConfusionMatrix(20, device=device)
-    iou_fn = IoU(cm)
-    miou_fn = mIoU(cm)
     with torch.no_grad():
-        for pos, color, normal, y, sort_idx, counts in pbar:
+        for pos, color, normal, sort_idx, counts, name in pbar:
+            # print(f'{rank},     {name}')
             pos = pos.to(device)
             color = color.to(device)
             normal = normal.to(device)
-            y = y.to(device)
             
-            sort_idx = sort_idx.squeeze().numpy()
-            counts = counts.squeeze().numpy()
+            # sort_idx = sort_idx.squeeze().numpy()
+            # counts = counts.squeeze().numpy()
             
             all_pred = torch.zeros((1, 20, pos.shape[1]), dtype=torch.float32, device=device)
             all_idx = torch.zeros((1, pos.shape[1]), dtype=torch.float32, device=device)
@@ -153,40 +97,24 @@ def test_entire_room(dataloader, test_transform, model, loss_fn, device, model_p
                 # 做变换
                 cur_pos, cur_color, cur_normal = test_transform(cur_pos, cur_color, cur_normal)
                 with torch.cuda.amp.autocast():
-                    cur_pred = model(cur_pos, cur_color, cur_normal)
+                    cur_pred, _, _ = model(cur_pos, cur_color, cur_normal)
                 cur_pred = cur_pred.to(dtype=torch.float32)
                 all_pred[:, :, idx_select] += cur_pred
             
             all_pred = all_pred / all_idx.unsqueeze(dim=1)
+            dist.barrier()
             
-            loss += loss_fn(all_pred, y)
-            cm.update((all_pred, y))
-        
-    loss = loss / steps
-    # 计算oa和macc
-    matrix = cm.compute()
-    oa = matrix.diag().sum() / matrix.sum()
-    oa = oa.item()
-    macc = torch.mean(matrix.diag() / matrix.sum(dim=1)).item()
-    
-    iou = iou_fn.compute()
-    miou = miou_fn.compute().item()
-    
-    if rank == 0:
-        with open(log_dir, mode='a') as f:
-            for i in range(20):
-                f.write(f'{idx_to_class[i]}:   {iou[i]:.4f}\n')
-            f.write(f'test_loss={loss:.4f}, test_miou={miou:.4f}, test_oa={oa:.4f}, test_macc={macc:.4f}\n')
-            f.write('-------------------------------------------------------\n')
-        print(f'test_loss={loss:.4f}, test_miou={miou:.4f}, test_oa={oa:.4f}, test_macc={macc:.4f}')
+            save_file_name = save_dir / (str(name.stem) + '.txt')
+            all_pred = all_pred.argmax(dim=1).squeeze().cpu().numpy()
+            all_pred = np.vectorize(label_mapping.get)(all_pred)
+            np.savetxt(save_file_name, all_pred, fmt="%d")
 
 
-def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, log_dir, rank):
+# save_dir = Path('/mnt/Disk16T/chenhr/threed/pointnet++/scannet/save_zips/memory')
+label_mapping={0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9, 9: 10, 10: 11, 11: 12, 12: 14, 13: 16, 14: 24, 15: 28, 16: 33, 17: 34, 18: 36, 19: 39}
+def voting_test(dataloader, test_transform, model, device, model_path, rank):
     model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
     model.eval()
-    steps = len(dataloader)
-    idx_to_class = dataloader.dataset.idx_to_class
-    loss = 0
     scales = [0.95, 1.0, 1.05]
     rotations = [0, 0.5, 1, 1.5]
     
@@ -194,18 +122,14 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
         pbar = tqdm(dataloader)
     else:
         pbar = dataloader
-    cm = ConfusionMatrix(20, device=device)
-    iou_fn = IoU(cm)
-    miou_fn = mIoU(cm)
     with torch.no_grad():
-        for pos, color, normal, y, sort_idx, counts in pbar:
+        for pos, color, normal, sort_idx, counts, name in pbar:
             pos = pos.to(device)
             color = color.to(device)
             normal = normal.to(device)
-            y = y.to(device)
             
-            sort_idx = sort_idx.squeeze().numpy()
-            counts = counts.squeeze().numpy()
+            # sort_idx = sort_idx.squeeze().numpy()
+            # counts = counts.squeeze().numpy()
             
             all_pred = torch.zeros((1, 20, pos.shape[1]), dtype=torch.float32, device=device)
             all_idx = torch.zeros((1, pos.shape[1]), dtype=torch.float32, device=device)
@@ -230,35 +154,19 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
                                                                            cur_color, torch.matmul(cur_normal, rotmat))
                         temp_pos = temp_pos - temp_pos.min(dim=1)[0]
                         with torch.cuda.amp.autocast():
-                            cur_pred = model(temp_pos, temp_color, temp_normal)
+                            cur_pred, _, _ = model(temp_pos, temp_color, temp_normal)
                         cur_pred = cur_pred.to(dtype=torch.float32)
                         cum_temp += cur_pred
                 cum_temp = cum_temp / (len(scales) * len(rotations))
                 all_pred[:, :, idx_select] += cum_temp
             
             all_pred = all_pred / all_idx.unsqueeze(dim=1)
-            
-            loss += loss_fn(all_pred, y)
-            cm.update((all_pred, y))
             dist.barrier()
-        
-    loss = loss / steps
-    # 计算oa和macc
-    matrix = cm.compute()
-    oa = matrix.diag().sum() / matrix.sum()
-    oa = oa.item()
-    macc = torch.mean(matrix.diag() / matrix.sum(dim=1)).item()
-    
-    iou = iou_fn.compute()
-    miou = miou_fn.compute().item()
-    
-    if rank == 0:
-        with open(log_dir, mode='a') as f:
-            for i in range(20):
-                f.write(f'{idx_to_class[i]}:   {iou[i]:.4f}\n')
-            f.write(f'test_loss={loss:.4f}, test_miou={miou:.4f}, test_oa={oa:.4f}, test_macc={macc:.4f}\n')
-            f.write('-------------------------------------------------------\n')
-        print(f'test_loss={loss:.4f}, test_miou={miou:.4f}, test_oa={oa:.4f}, test_macc={macc:.4f}')
+            
+            save_file_name = save_dir / (str(name.stem) + '.txt')
+            all_pred = all_pred.argmax(dim=1).squeeze().cpu().numpy()
+            all_pred = np.vectorize(label_mapping.get)(all_pred)
+            np.savetxt(save_file_name, all_pred, fmt="%d")
 
 
 def get_parameter_groups(model, weight_decay, log_dir, rank):
@@ -295,7 +203,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     if args.use_ddp:
-        dist.init_process_group(backend='nccl')
+        dist.init_process_group(backend='nccl', timeout=datetime.timedelta(seconds=180000))
         rank = int(os.environ['RANK'])
     else:
         rank = 0
@@ -303,7 +211,7 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    log_dir = 'scannet/logs/pointnext_scannet_norm.log'
+    log_dir = 'scannet/logs/memorynet_scannet_norm_trainval.log'
     # logging.basicConfig(filename=log_dir, format='%(message)s', level=logging.INFO)
     if rank == 0:
         with open(log_dir, mode='a') as f:
@@ -316,51 +224,51 @@ if __name__ == '__main__':
                          ColorContrast(p=0.2),
                          ColorDrop(p=0.2),
                          ColorNormalize(mean=[0, 0, 0], std=[1, 1, 1])])
-    train_dataset = Scannet('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_norm', split='train', loop=6, npoints=64000, transforms=train_aug)
-    val_aug = Compose([ColorNormalize(mean=[0, 0, 0], std=[1, 1, 1])])
-    val_dataset = Scannet('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_norm', split='val', loop=1, npoints=None, transforms=val_aug)
+    train_dataset = Scannet('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_norm', split='trainval', loop=6, npoints=64000, transforms=train_aug)
     
     if args.use_ddp:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
         train_dataloader = DataLoader(train_dataset, batch_size=4, num_workers=8, sampler=train_sampler)
-        val_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=8, sampler=val_sampler)
     else:
         train_dataloader = DataLoader(train_dataset, batch_size=4, num_workers=8, shuffle=True)
-        val_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=8, shuffle=False)
 
     device = f'cuda:{rank}'
     torch.cuda.set_device(device)
 
-    pointnet2 = Pointnet2(20).to(device)
+    pointnet2 = Pointnet2_Memory(20, args.use_ddp).to(device)
     if args.use_ddp:
         pointnet2 = nn.SyncBatchNorm.convert_sync_batchnorm(pointnet2)
         pointnet2 = nn.parallel.DistributedDataParallel(pointnet2, device_ids=[rank], output_device=rank)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.2, ignore_index=20)
     
     # 配置不同的weight decay
-    parameter_group = get_parameter_groups(pointnet2, weight_decay=1e-4, log_dir=log_dir)
+    parameter_group = get_parameter_groups(pointnet2, weight_decay=1e-4, log_dir=log_dir, rank=rank)
     optimizer = torch.optim.AdamW(parameter_group, lr=0.001)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [70, 90], 0.1)
 
     epochs = 100
     show_gap = 1
-    save_path = 'scannet/checkpoints/pointnet2_scannet_norm.pth'
-    for i in range(epochs):
-        if args.use_ddp:
-            train_sampler.set_epoch(i)
-        train_loop(train_dataloader, pointnet2, loss_fn, optimizer, device, i, epochs, show_gap, 1, rank)
-        val_loop(val_dataloader, pointnet2, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir, rank)
-        lr_scheduler.step()
+    save_path = 'scannet/checkpoints/memorynet_scannet_norm_trainval.pth'
+    # for i in range(epochs):
+    #     if args.use_ddp:
+    #         train_sampler.set_epoch(i)
+    #     train_loop(train_dataloader, pointnet2, loss_fn, optimizer, device, i, epochs, show_gap, 1, rank)
+    #     if rank == 0:
+    #         torch.save({'epoch': i,
+    #                     'model_state_dict': pointnet2.state_dict(),
+    #                     'optimizer_state_dict': optimizer.state_dict(),
+    #                     'scheduler_state_dict': lr_scheduler.state_dict()}, save_path)
+    #     lr_scheduler.step()
     
     # test entire room
     test_aug = Compose([ColorNormalizeTensor(mean=[0, 0, 0], std=[1, 1, 1])])
-    test_dataset = Scannet('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_norm', split='val_test', loop=1)
+    test_dataset = Scannet_Test('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_test', loop=1)
+    # temp = test_dataset[0]   # debug
     if args.use_ddp:
         test_sampler = DistributedSampler(test_dataset, shuffle=False)
-        test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, sampler=test_sampler)
+        test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, sampler=test_sampler, collate_fn=scan_test_collate_fn)
     else:
-        test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, shuffle=False)
-    test_entire_room(test_dataloader, test_aug, pointnet2, loss_fn, device, save_path, log_dir, rank)
-    voting_test(test_dataloader, test_aug, pointnet2, loss_fn, device, save_path, log_dir, rank)
+        test_dataloader = DataLoader(test_dataset, batch_size=1, num_workers=8, shuffle=False, collate_fn=scan_test_collate_fn)
+    test_entire_room(test_dataloader, test_aug, pointnet2, device, save_path, rank)
+    # voting_test(test_dataloader, test_aug, pointnet2, device, save_path, rank)
     

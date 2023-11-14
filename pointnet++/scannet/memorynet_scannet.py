@@ -14,7 +14,8 @@ sys.path.append('/mnt/Disk16T/chenhr/threed/pointnet++')
 from dataset import Scannet
 from data_aug import *
 from data_aug_tensor import *
-from model import Pointnet2
+from model_memory import Pointnet2_Memory
+from lovasz_loss import lovasz_softmax
 import math
 
 
@@ -36,8 +37,8 @@ def train_loop(dataloader, model, loss_fn, optimizer, device,
         y = y.to(device)
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
-            y_pred = model(pos, color, normal)
-            loss = loss_fn(y_pred, y)
+            y_pred, coarse_seg_loss, contrast_loss = model(pos, color, normal, y, cur_epoch/total_epoch)
+            loss = loss_fn(y_pred, y) + coarse_seg_loss + contrast_loss + 3 * lovasz_softmax(y_pred.softmax(dim=1), y, ignore=20)
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -77,7 +78,7 @@ def val_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, device, cur_ep
             normal = normal.to(device)
             y = y.to(device)
             with torch.cuda.amp.autocast():
-                y_pred = model(pos, color, normal)
+                y_pred, _, _ = model(pos, color, normal)
                 loss += loss_fn(y_pred, y)
 
             cm.update((y_pred, y))
@@ -153,7 +154,7 @@ def test_entire_room(dataloader, test_transform, model, loss_fn, device, model_p
                 # 做变换
                 cur_pos, cur_color, cur_normal = test_transform(cur_pos, cur_color, cur_normal)
                 with torch.cuda.amp.autocast():
-                    cur_pred = model(cur_pos, cur_color, cur_normal)
+                    cur_pred, _, _ = model(cur_pos, cur_color, cur_normal)
                 cur_pred = cur_pred.to(dtype=torch.float32)
                 all_pred[:, :, idx_select] += cur_pred
             
@@ -230,7 +231,7 @@ def voting_test(dataloader, test_transform, model, loss_fn, device, model_path, 
                                                                            cur_color, torch.matmul(cur_normal, rotmat))
                         temp_pos = temp_pos - temp_pos.min(dim=1)[0]
                         with torch.cuda.amp.autocast():
-                            cur_pred = model(temp_pos, temp_color, temp_normal)
+                            cur_pred, _, _ = model(temp_pos, temp_color, temp_normal)
                         cur_pred = cur_pred.to(dtype=torch.float32)
                         cum_temp += cur_pred
                 cum_temp = cum_temp / (len(scales) * len(rotations))
@@ -303,7 +304,7 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    log_dir = 'scannet/logs/pointnext_scannet_norm.log'
+    log_dir = 'scannet/logs/memorynet_scannet_norm.log'
     # logging.basicConfig(filename=log_dir, format='%(message)s', level=logging.INFO)
     if rank == 0:
         with open(log_dir, mode='a') as f:
@@ -332,20 +333,20 @@ if __name__ == '__main__':
     device = f'cuda:{rank}'
     torch.cuda.set_device(device)
 
-    pointnet2 = Pointnet2(20).to(device)
+    pointnet2 = Pointnet2_Memory(20, args.use_ddp).to(device)
     if args.use_ddp:
         pointnet2 = nn.SyncBatchNorm.convert_sync_batchnorm(pointnet2)
         pointnet2 = nn.parallel.DistributedDataParallel(pointnet2, device_ids=[rank], output_device=rank)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.2, ignore_index=20)
     
     # 配置不同的weight decay
-    parameter_group = get_parameter_groups(pointnet2, weight_decay=1e-4, log_dir=log_dir)
+    parameter_group = get_parameter_groups(pointnet2, weight_decay=1e-4, log_dir=log_dir, rank=rank)
     optimizer = torch.optim.AdamW(parameter_group, lr=0.001)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [70, 90], 0.1)
 
     epochs = 100
     show_gap = 1
-    save_path = 'scannet/checkpoints/pointnet2_scannet_norm.pth'
+    save_path = 'scannet/checkpoints/memorynet_scannet_norm.pth'
     for i in range(epochs):
         if args.use_ddp:
             train_sampler.set_epoch(i)
