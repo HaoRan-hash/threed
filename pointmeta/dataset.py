@@ -380,26 +380,10 @@ class Scannet(Dataset):
 
 
 class Scannet_Test(Dataset):
-    def __init__(self, root, split, loop, npoints=64000, voxel_size=0.02, transforms=None):
-        super(Scannet, self).__init__()
+    def __init__(self, root, loop, npoints=64000, voxel_size=0.02, transforms=None):
+        super().__init__()
         self.root = root
-        with open('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_train.txt', 'r') as file:
-            scan_train = [line.strip() for line in file.readlines()]
-        with open('/mnt/Disk16T/chenhr/threed_data/data/scannetv2_val.txt', 'r') as file:
-            scan_val = [line.strip() for line in file.readlines()]
-        self.split = split
-        if split == 'train':
-            self.room_list = [root / f"{p}.pt" for p in scan_train]
-        elif split == 'val':
-            self.room_list = [root / f"{p}.pt" for p in scan_val]
-        elif split == 'trainval':
-            scan_tarinval = scan_train + scan_val
-            self.room_list = [root / f"{p}.pt" for p in scan_tarinval]
-        elif split == 'test':
-            self.room_list = list(Path(root).iterdir())
-        else:
-            raise ValueError(f'Not support {split} type')
-
+        self.room_list = list(Path(root).iterdir())
         self.loop = loop
         self.npoints = npoints
         self.voxel_size = voxel_size
@@ -437,50 +421,29 @@ class Scannet_Test(Dataset):
         hash_sort = voxel_hash[sort_idx]
         
         _, counts = np.unique(hash_sort, return_counts=True)
-        if self.split == 'test':   # test时需要的东西和train，val时不同
-            return sort_idx, counts
-        
-        idx_select = np.cumsum(np.insert(counts, 0, 0)[0:-1]) + np.random.randint(0, counts.max(), counts.size) % counts
-        return sort_idx[idx_select]
+        return sort_idx, counts
     
     def __getitem__(self, index):
         room = self.room_list[index % len(self.room_list)]
-        points = torch.load(room)
-        pos, x, y = points[0], points[1], points[2]
-        x = (x + 1) * 127.5   # [-1, 1] -> [0, 255]
+        pos, color, normal = torch.load(room)   # color的范围是[0, 255]
+        pos, color, normal = pos.numpy(), color.numpy(), normal.numpy()
         
         if self.transforms:
-            pos, x = self.transforms(pos, x)
+            pos, color, normal = self.transforms(pos, color, normal)
+        pos = pos - pos.min(0)
         
-        if self.split == 'test':
-            sort_idx, counts = self.voxel_grid_sampling(pos)
-            pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-            return pos, x, y, sort_idx, counts
+        sort_idx, counts = self.voxel_grid_sampling(pos)
+        pos, color, normal = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32)
+        return pos, color, normal, sort_idx, counts, room
 
-        # train, val的流程
-        sample_indices = self.voxel_grid_sampling(pos)
-        pos, x, y = pos[sample_indices], x[sample_indices], y[sample_indices]
-        
-        # 是否指定了npoints
-        if self.npoints:
-            n = len(sample_indices)
-            if n > self.npoints:
-                init_idx = np.random.randint(n)
-                crop_indices = np.argsort(np.sum(np.square(pos - pos[init_idx]), 1))[:self.npoints]
-            elif n < self.npoints:
-                temp = np.arange(n)
-                pad_choice = np.random.choice(n, self.npoints - n)
-                crop_indices = np.hstack([temp, temp[pad_choice]])
-            else:
-                crop_indices = np.arange(n)
-            
-            # 打乱
-            np.random.shuffle(crop_indices)
-        
-            pos, x, y = pos[crop_indices], x[crop_indices], y[crop_indices]
-        
-        pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-        return pos, x, y
+
+def scan_test_collate_fn(batch):
+    pos, color, normal, sort_idx, counts, name = batch[0]
+    pos = torch.as_tensor(pos).unsqueeze(dim=0)
+    color = torch.as_tensor(color).unsqueeze(dim=0)
+    normal = torch.as_tensor(normal).unsqueeze(dim=0)
+    
+    return pos, color, normal, sort_idx, counts, name
 
 
 if __name__ == '__main__':
