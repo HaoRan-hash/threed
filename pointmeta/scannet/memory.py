@@ -5,7 +5,7 @@ import torch.distributed as dist
 import math
 import os
 import sys
-sys.path.append('/mnt/Disk16T/chenhr/threed/pointmeta')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import SemanticAwareAttention
 
 

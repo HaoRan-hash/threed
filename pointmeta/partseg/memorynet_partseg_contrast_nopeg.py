@@ -6,7 +6,8 @@ import torch.nn.functional as F
 from ignite.metrics import Accuracy
 from tqdm import tqdm
 import sys
-sys.path.append('/home/lindi/chenhr/threed/pointmeta')
+sys.path.append('/mnt/Disk16T/chenhr/threed/data_engine')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PolyFocalLoss, SemanticAwareAttention_Mask
 from dataset import ShapeNet
 from data_aug import *
@@ -282,10 +283,10 @@ class Memorynet(nn.Module):
                                     nn.Dropout(0.5),
                                     nn.Conv1d(480, num_class, kernel_size=1))
 
-    def forward(self, pos, x, object_labels, y=None, epoch_ratio=None):
+    def forward(self, pos, normal, object_labels, y=None, epoch_ratio=None):
         """
         pos.shape = (b, n, 3)
-        x.shape = (b, n, 4)
+        normal.shape = (b, n, 4)
         object_labels.shape = (b,)
         y.shape = (b, n)
         """
@@ -296,7 +297,7 @@ class Memorynet(nn.Module):
         mask_float = mask_float.unsqueeze(dim=1)
         
         n = pos.shape[1]
-        x = torch.cat((pos, x), dim=-1)
+        x = torch.cat((pos, normal), dim=-1)
         x = self.in_linear(x)
 
         pos1, x1, y1 = self.sa1(pos, x, y)
@@ -346,14 +347,14 @@ def train_loop(dataloader, model, loss_fn, metric_fn, optimizer, device,
     else:
         pbar = dataloader
     
-    for i, (pos, x, y, object_labels) in enumerate(pbar):
+    for i, (pos, normal, y, object_labels) in enumerate(pbar):
         pos = pos.to(device)
-        x = x.to(device)
+        normal = normal.to(device)
         y = y.to(device)
         object_labels = object_labels.to(device)
         optimizer.zero_grad()
         
-        y_pred, coarse_seg_loss, contrast_loss = model(pos, x, object_labels, y, cur_epoch/total_epoch)
+        y_pred, coarse_seg_loss, contrast_loss = model(pos, normal, object_labels, y, cur_epoch/total_epoch)
         loss = loss_fn(y_pred, y) + + coarse_seg_loss + contrast_loss
         
         loss.backward()
@@ -400,13 +401,13 @@ def val_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, device, cur_ep
     object_mious = [[] for _ in range(16)]
     
     with torch.no_grad():
-        for pos, x, y, object_labels in dataloader:
+        for pos, normal, y, object_labels in dataloader:
             pos = pos.to(device)
-            x = x.to(device)
+            normal = normal.to(device)
             y = y.to(device)
             object_labels = object_labels.to(device)
             
-            y_pred, _, _ = model(pos, x, object_labels)
+            y_pred, _, _ = model(pos, normal, object_labels)
             loss += loss_fn(y_pred, y)
             
             y_pred = y_pred.permute(0, 2, 1)
@@ -463,17 +464,17 @@ def voting_test(dataloader, model, loss_fn, device, model_path, log_dir, voting_
     voting_transforms = Compose([PointCloudScalingBatch(0.8, 1.2)])
 
     with torch.no_grad():
-        for pos, x, y, object_labels in tqdm(dataloader):
+        for pos, normal, y, object_labels in tqdm(dataloader):
             pos = pos.to(device)
-            x = x.to(device)
+            normal = normal.to(device)
             y = y.to(device)
             object_labels = object_labels.to(device)
             
             # voting test
             y_pred = torch.zeros((pos.shape[0], 50, pos.shape[1]), dtype=torch.float32, device=device)
             for i in range(voting_num):
-                temp_pos, temp_x = voting_transforms(pos, x)
-                temp_pred, _, _ = model(temp_pos, temp_x, object_labels)
+                temp_pos, _, temp_normal = voting_transforms(pos, None, normal)
+                temp_pred, _, _ = model(temp_pos, temp_normal, object_labels)
                 y_pred += temp_pred
             y_pred = y_pred / voting_num
             
@@ -541,7 +542,7 @@ def get_parameter_groups(model, weight_decay, log_dir):
     return list(parameter_group_vars.values())
 
 
-object_to_part_onehot = torch.zeros((16, 50), dtype=torch.uint8, device='cuda:4')
+object_to_part_onehot = torch.zeros((16, 50), dtype=torch.uint8, device='cuda:6')
 def transform_object_label():
     for i in range(16):
         for part in object_to_part[i]:
@@ -554,7 +555,7 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    log_dir = 'partseg/memorynet_partseg_contrast_nopeg.log'
+    log_dir = 'partseg/logs/memorynet_partseg_contrast_nopeg_2.log'
     # logging.basicConfig(filename=log_dir, format='%(message)s', level=logging.INFO)
     with open(log_dir, mode='a') as f:
         f.write(f'random seed {seed}\n')
@@ -563,16 +564,16 @@ if __name__ == '__main__':
                          PointCloudCenterAndNormalize(),
                          PointCloudJitter(0.001, 0.005),
                          NormalDrop(0.2)])
-    train_dataset = ShapeNet('/home/lindi/chenhr/threed/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
+    train_dataset = ShapeNet('/mnt/Disk16T/chenhr/threed_data/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
                              split='train', npoints=2048, transforms=train_aug)
     val_aug = Compose([PointCloudCenterAndNormalize()])
-    val_dataset = ShapeNet('/home/lindi/chenhr/threed/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
+    val_dataset = ShapeNet('/mnt/Disk16T/chenhr/threed_data/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
                             split='test', npoints=2048, transforms=val_aug)
 
     train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8)
     val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=8)
 
-    device = 'cuda:4'
+    device = 'cuda:6'
 
     memorynet = Memorynet(50).to(device)
     loss_fn = PolyFocalLoss(2.0, 0.25, 1.0)
@@ -585,14 +586,15 @@ if __name__ == '__main__':
 
     epochs = 200
     show_gap = 1
-    save_path = 'partseg/memorynet_partseg_contrast_nopeg.pth'
-    for i in range(epochs):
-        train_loop(train_dataloader, memorynet, loss_fn, metric_acc, optimizer, device, i, epochs, show_gap, 1)
-        val_loop(val_dataloader, memorynet, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir)
-        lr_scheduler.step()
+    # save_path = 'partseg/checkpoints/memorynet_partseg_contrast_nopeg_2.pth'
+    save_path = 'partseg/checkpoints/memorynet_partseg_contrast_nopeg.pth'
+    # for i in range(epochs):
+    #     train_loop(train_dataloader, memorynet, loss_fn, metric_acc, optimizer, device, i, epochs, show_gap, 1)
+    #     val_loop(val_dataloader, memorynet, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir)
+    #     lr_scheduler.step()
     
     # voting test
-    test_dataset = ShapeNet('/home/lindi/chenhr/threed/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
+    test_dataset = ShapeNet('/mnt/Disk16T/chenhr/threed_data/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
                             split='test', npoints=2048, transforms=val_aug)
-    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=8)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8)
     voting_test(test_dataloader, memorynet, loss_fn, device, save_path, log_dir, 10)

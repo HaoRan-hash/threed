@@ -8,7 +8,7 @@ from tqdm import tqdm
 import json
 import sys
 sys.path.append('/home/lindi/chenhr/threed/pointmeta')
-from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PEGenerator, SemanticAwareAttention
+from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PEGenerator_Meta as PEGenerator, SemanticAwareAttention
 from dataset import S3dis
 from data_aug import *
 from data_aug_tensor import *

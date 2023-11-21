@@ -7,8 +7,9 @@ from ignite.metrics import Accuracy, ConfusionMatrix, IoU, mIoU
 from tqdm import tqdm
 import json
 import sys
-sys.path.append('/mnt/Disk16T/chenhr/threed/pointmeta')
-from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PEGenerator, SemanticAwareAttention
+sys.path.append('/mnt/Disk16T/chenhr/threed/data_engine')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
+from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PEGenerator_Meta as PEGenerator, SemanticAwareAttention
 from dataset import S3dis
 from data_aug import *
 from data_aug_tensor import *
@@ -347,13 +348,13 @@ class Memorynet(nn.Module):
                                      nn.Dropout(0.5),
                                      nn.Conv1d(64, num_class, kernel_size=1))
     
-    def forward(self, pos, x, y=None, epoch_ratio=None):
+    def forward(self, pos, color, y=None, epoch_ratio=None):
         """
         pos.shape = (b, n, 3)
-        x.shape = (b, n, c)
+        color.shape = (b, n, 3)
         y.shape = (b, n)
         """
-        x = torch.cat((pos[:, :, -1:], x), dim=-1)
+        x = torch.cat((pos[:, :, -1:], color), dim=-1)
         x = self.in_linear(x)
         
         pos1, x1, y1 = self.stage1(pos, x, y)
@@ -409,14 +410,14 @@ def train_loop(dataloader, model, loss_fn, metric_fn, optimizer, device,
     
     scaler = torch.cuda.amp.GradScaler()
     
-    for i, (pos, x, y) in enumerate(pbar):
+    for i, (pos, color, y) in enumerate(pbar):
         pos = pos.to(device)
-        x = x.to(device)
+        color = color.to(device)
         y = y.to(device)
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
-            y_pred, coarse_seg_loss, contrast_loss = model(pos, x, y, cur_epoch/total_epoch)
-            loss = loss_fn(y_pred, y) + coarse_seg_loss + contrast_loss + 0.5 * lovasz_softmax(y_pred.softmax(dim=1), y)
+            y_pred, coarse_seg_loss, contrast_loss = model(pos, color, y, cur_epoch/total_epoch)
+            loss = loss_fn(y_pred, y) + coarse_seg_loss + contrast_loss
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -445,12 +446,12 @@ def val_loop(dataloader, model, loss_fn, optimizer, lr_scheduler, device, cur_ep
     iou_fn = IoU(cm)
     miou_fn = mIoU(cm)
     with torch.no_grad():
-        for pos, x, y in dataloader:
+        for pos, color, y in dataloader:
             pos = pos.to(device)
-            x = x.to(device)
+            color = color.to(device)
             y = y.to(device)
             with torch.cuda.amp.autocast():
-                y_pred, _, _ = model(pos, x)
+                y_pred, _, _ = model(pos, color)
                 loss += loss_fn(y_pred, y)
 
             oa.update((y_pred, y))
@@ -498,9 +499,9 @@ def test_entire_room(dataloader, test_transform, model, loss_fn, device, model_p
     iou_fn = IoU(cm)
     miou_fn = mIoU(cm)
     with torch.no_grad():
-        for pos, x, y, sort_idx, counts in pbar:
+        for pos, color, y, sort_idx, counts in pbar:
             pos = pos.to(device)
-            x = x.to(device)
+            color = color.to(device)
             y = y.to(device)
             
             sort_idx = sort_idx.squeeze().numpy()
@@ -515,12 +516,12 @@ def test_entire_room(dataloader, test_transform, model, loss_fn, device, model_p
                 all_idx[0, idx_select] += 1
                 
                 cur_pos = pos[:, idx_select, :]
-                cur_x = x[:, idx_select, :]
+                cur_color = color[:, idx_select, :]
                 cur_pos = cur_pos - cur_pos.min(dim=1, keepdim=True)[0]
                 
                 # 做变换
-                cur_pos, cur_x = test_transform(cur_pos, cur_x)
-                cur_pred, _, _ = model(cur_pos, cur_x)
+                cur_pos, cur_color, _ = test_transform(cur_pos, cur_color, None)
+                cur_pred, _, _ = model(cur_pos, cur_color)
                 all_pred[:, :, idx_select] += cur_pred
             
             all_pred = all_pred / all_idx.unsqueeze(dim=1)
@@ -560,9 +561,9 @@ def multi_scale_test(dataloader, test_transform, model, loss_fn, device, model_p
     iou_fn = IoU(cm)
     miou_fn = mIoU(cm)
     with torch.no_grad():
-        for pos, x, y, sort_idx, counts in pbar:
+        for pos, color, y, sort_idx, counts in pbar:
             pos = pos.to(device)
-            x = x.to(device)
+            color = color.to(device)
             y = y.to(device)
             
             sort_idx = sort_idx.squeeze().numpy()
@@ -577,20 +578,20 @@ def multi_scale_test(dataloader, test_transform, model, loss_fn, device, model_p
                 all_idx[0, idx_select] += 1
                 
                 cur_pos = pos[:, idx_select, :]
-                cur_x = x[:, idx_select, :]
+                cur_color = color[:, idx_select, :]
                 cur_pos = cur_pos - cur_pos.min(dim=1, keepdim=True)[0]
                 
                 multi_scale_pos = []
-                multi_scale_x = []
+                multi_scale_color = []
                 for scale in scales:
                     # 做变换
-                    temp1, temp2 = test_transform(cur_pos * scale, cur_x)
+                    temp1, temp2, _ = test_transform(cur_pos * scale, cur_color, None)
                     multi_scale_pos.append(temp1)
-                    multi_scale_x.append(temp2)
+                    multi_scale_color.append(temp2)
                 multi_scale_pos = torch.cat(multi_scale_pos, dim=0)
-                multi_scale_x = torch.cat(multi_scale_x, dim=0)
+                multi_scale_color = torch.cat(multi_scale_color, dim=0)
                 
-                cur_pred, _, _ = model(multi_scale_pos, multi_scale_x)
+                cur_pred, _, _ = model(multi_scale_pos, multi_scale_color)
                 cur_pred = cur_pred.mean(dim=0)
                 all_pred[:, :, idx_select] += cur_pred
             
@@ -647,7 +648,7 @@ def get_parameter_groups(model, weight_decay, log_dir):
 
 if __name__ == '__main__':
     seed = np.random.randint(1, 10000)
-    seed = 4291
+    seed = 4292
     torch.manual_seed(seed)
     np.random.seed(seed)
     
@@ -659,11 +660,11 @@ if __name__ == '__main__':
     train_aug = Compose([ColorContrast(p=0.2),
                          PointCloudScaling(0.9, 1.1),
                          PointCloudFloorCentering(),
-                         PointCloudRotation_Z(1.0),
+                         PointCloudRotation_Z(1.0, False),
                          PointCloudJitter(0.005, 0.02),
                          ColorDrop(p=0.2),
                          ColorNormalize()])
-    train_dataset = S3dis('/mnt/Disk16T/chenhr/threed_data/data/processed_s3dis', split='train', loop=30, npoints=30000, transforms=train_aug, test_area=5)
+    train_dataset = S3dis('/mnt/Disk16T/chenhr/threed_data/data/processed_s3dis', split='train', loop=30, npoints=24000, transforms=train_aug, test_area=5)
     val_aug = Compose([PointCloudFloorCentering(),
                         ColorNormalize()])
     val_dataset = S3dis('/mnt/Disk16T/chenhr/threed_data/data/processed_s3dis', split='val', loop=1, npoints=None, transforms=val_aug, test_area=5)
@@ -685,6 +686,7 @@ if __name__ == '__main__':
     epochs = 100
     show_gap = 1
     save_path = f'seg/checkpoints/memorynet_seg_4_contrast_area5_{seed}.pth'
+    # save_path = '/mnt/Disk16T/chenhr/threed/pointmeta/seg/checkpoints/memorynet_seg_4_contrast_area5.pth'
     for i in range(epochs):
         train_loop(train_dataloader, memorynet, loss_fn, metric_acc, optimizer, device, i, epochs, show_gap, 1)
         val_loop(val_dataloader, memorynet, loss_fn, optimizer, lr_scheduler, device, i, save_path, show_gap, log_dir)
