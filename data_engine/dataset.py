@@ -57,13 +57,13 @@ class ShapeNet(Dataset):
         else:
             points = points[0:self.npoints]   # 为了可复现性
         
-        pos, x, y = points[:, 0:3], points[:, 3:6], points[:, -1]
+        pos, normal, y = points[:, 0:3], points[:, 3:6], points[:, -1]
         if self.transforms:
-            pos, x = self.transforms(pos, x)
+            pos, _, normal = self.transforms(pos, None, normal)
         
-        pos, x, y, object_label = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64), object_label.astype(np.int64)
+        pos, normal, y, object_label = pos.astype(np.float32), normal.astype(np.float32), y.astype(np.int64), object_label.astype(np.int64)
 
-        return pos, x, y, object_label
+        return pos, normal, y, object_label
 
 
 class S3dis(Dataset):
@@ -128,13 +128,13 @@ class S3dis(Dataset):
         
         if self.split == 'test':
             sort_idx, counts = self.voxel_grid_sampling(points[:, 0:3])
-            pos, x, y = points[:, 0:3], points[:, 3:-1], points[:, -1]
-            pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-            return pos, x, y, sort_idx, counts
+            pos, color, y = points[:, 0:3], points[:, 3:-1], points[:, -1]
+            pos, color, y = pos.astype(np.float32), color.astype(np.float32), y.astype(np.int64)
+            return pos, color, y, sort_idx, counts, room
         
         # train, val的流程
         sample_indices = self.voxel_grid_sampling(points[:, 0:3])
-        pos, x, y = points[sample_indices, 0:3], points[sample_indices, 3:-1], points[sample_indices, -1]
+        pos, color, y = points[sample_indices, 0:3], points[sample_indices, 3:-1], points[sample_indices, -1]
         
         # 是否指定了npoints
         if self.npoints:
@@ -152,128 +152,14 @@ class S3dis(Dataset):
             # 打乱
             np.random.shuffle(crop_indices)
         
-            pos, x, y = pos[crop_indices], x[crop_indices], y[crop_indices]
+            pos, color, y = pos[crop_indices], color[crop_indices], y[crop_indices]
         
         pos = pos - pos.min(0)
         if self.transforms:
-            pos, x = self.transforms(pos, x)
+            pos, color, _ = self.transforms(pos, color, None)
         
-        pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-        return pos, x, y
-
-
-class S3dis_pkl(Dataset):
-    def __init__(self, root, split, loop, npoints=24000, voxel_size=0.04, test_area=5, transforms=None):
-        super(S3dis_pkl, self).__init__()
-        self.root = root
-        self.split = split
-        self.loop = loop
-        self.npoints = npoints
-        self.voxel_size = voxel_size
-        self.transforms = transforms
-        self.idx_to_class = {0: 'ceiling', 1: 'floor', 2: 'wall', 3: 'beam', 4: 'column', 
-                5: 'window', 6: 'door', 7: 'table', 8: 'chair', 9: 'sofa', 10: 'bookcase', 11: 'board', 12: 'clutter'}
-        
-        room_list = os.listdir(root)
-        if split == 'train':
-            self.room_list = list(filter(lambda x : (f'Area_{test_area}' not in x) and (x != 'pkls'), room_list))
-        else:
-            self.room_list = list(filter(lambda x : f'Area_{test_area}' in x, room_list))
-        
-        pkl_path = os.path.join(root, 'pkls', f'val_area{test_area}.pkl')
-        if split == 'val' and not os.path.exists(pkl_path):
-            self.data = []
-            for room in self.room_list:
-                points = np.load(os.path.join(root, room))
-                points[:, 0:3] = points[:, 0:3] - np.min(points[:, 0:3], axis=0)
-                sample_indices = self.voxel_grid_sampling(points[:, 0:3])
-                self.data.append(points[sample_indices])
-            with open(pkl_path, 'wb') as f:
-                pickle.dump(self.data, f)
-        elif split == 'val':
-            with open(pkl_path, 'rb') as f:
-                self.data = pickle.load(f)
-        
-    def __len__(self):
-        return len(self.room_list) * self.loop
-
-    def fnv_hash_vec(self, arr):
-        """
-        FNV64-1A
-        """
-        assert arr.ndim == 2
-        # Floor first for negative coordinates
-        arr = arr.copy()
-        arr = arr.astype(np.uint64, copy=False)
-        hashed_arr = np.uint64(14695981039346656037) * \
-            np.ones(arr.shape[0], dtype=np.uint64)
-        for j in range(arr.shape[1]):
-            hashed_arr *= np.uint64(1099511628211)
-            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
-        return hashed_arr
-
-    def voxel_grid_sampling(self, pos):
-        """
-        pos.shape = (n, 3)
-        """
-        voxel_indices = np.floor(pos / self.voxel_size)
-        
-        voxel_hash = self.fnv_hash_vec(voxel_indices)
-        sort_idx = voxel_hash.argsort()
-        hash_sort = voxel_hash[sort_idx]
-        
-        _, counts = np.unique(hash_sort, return_counts=True)
-        if self.split == 'test':   # test时需要的东西和train，val时不同
-            return sort_idx, counts
-        
-        idx_select = np.cumsum(np.insert(counts, 0, 0)[0:-1]) + np.random.randint(0, counts.max(), counts.size) % counts
-        return sort_idx[idx_select]
-    
-    def __getitem__(self, index):
-        if self.split == 'val':
-            points = self.data[index % len(self.room_list)]
-            pos, x, y = points[:, 0:3], points[:, 3:-1], points[:, -1]
-        else:
-            room = os.path.join(self.root, self.room_list[index % len(self.room_list)])
-            points = np.load(room)
-            
-            # 大家都这样做
-            points[:, 0:3] = points[:, 0:3] - np.min(points[:, 0:3], axis=0)
-            
-            if self.split == 'test':
-                sort_idx, counts = self.voxel_grid_sampling(points[:, 0:3])
-                pos, x, y = points[:, 0:3], points[:, 3:-1], points[:, -1]
-                pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-                return pos, x, y, sort_idx, counts
-            
-            # train的流程
-            sample_indices = self.voxel_grid_sampling(points[:, 0:3])
-            pos, x, y = points[sample_indices, 0:3], points[sample_indices, 3:-1], points[sample_indices, -1]
-            
-            # 是否指定了npoints
-            if self.npoints:
-                n = len(sample_indices)
-                if n > self.npoints:
-                    init_idx = np.random.randint(n)
-                    crop_indices = np.argsort(np.sum(np.square(pos - pos[init_idx]), 1))[:self.npoints]
-                elif n < self.npoints:
-                    temp = np.arange(n)
-                    pad_choice = np.random.choice(n, self.npoints - n)
-                    crop_indices = np.hstack([temp, temp[pad_choice]])
-                else:
-                    crop_indices = np.arange(n)
-                
-                # 打乱
-                np.random.shuffle(crop_indices)
-            
-                pos, x, y = pos[crop_indices], x[crop_indices], y[crop_indices]
-        
-        pos = pos - pos.min(0)
-        if self.transforms:
-            pos, x = self.transforms(pos, x)
-        
-        pos, x, y = pos.astype(np.float32), x.astype(np.float32), y.astype(np.int64)
-        return pos, x, y
+        pos, color, y = pos.astype(np.float32), color.astype(np.float32), y.astype(np.int64)
+        return pos, color, y
 
 
 class Scannet(Dataset):
@@ -350,7 +236,7 @@ class Scannet(Dataset):
         if self.split == 'val_test':
             sort_idx, counts = self.voxel_grid_sampling(pos)
             pos, color, normal, y = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32), y.astype(np.int64)
-            return pos, color, normal, y, sort_idx, counts
+            return pos, color, normal, y, sort_idx, counts, room
 
         # train, val的流程
         sample_indices = self.voxel_grid_sampling(pos)
@@ -381,7 +267,7 @@ class Scannet(Dataset):
 
 class Scannet_Test(Dataset):
     def __init__(self, root, loop, npoints=64000, voxel_size=0.02, transforms=None):
-        super(Scannet, self).__init__()
+        super().__init__()
         self.root = root
         self.room_list = list(Path(root).iterdir())
         self.loop = loop
@@ -421,11 +307,7 @@ class Scannet_Test(Dataset):
         hash_sort = voxel_hash[sort_idx]
         
         _, counts = np.unique(hash_sort, return_counts=True)
-        if self.split == 'test':   # test时需要的东西和train，val时不同
-            return sort_idx, counts
-        
-        idx_select = np.cumsum(np.insert(counts, 0, 0)[0:-1]) + np.random.randint(0, counts.max(), counts.size) % counts
-        return sort_idx[idx_select]
+        return sort_idx, counts
     
     def __getitem__(self, index):
         room = self.room_list[index % len(self.room_list)]
@@ -439,6 +321,120 @@ class Scannet_Test(Dataset):
         sort_idx, counts = self.voxel_grid_sampling(pos)
         pos, color, normal = pos.astype(np.float32), color.astype(np.float32), normal.astype(np.float32)
         return pos, color, normal, sort_idx, counts, room
+
+
+class Scannet_NoNorm(Dataset):
+    def __init__(self, root, split, loop, npoints=64000, voxel_size=0.02, transforms=None):
+        super().__init__()
+        self.root = root
+        self.split = split
+        self.loop = loop
+        self.npoints = npoints
+        self.voxel_size = voxel_size
+        self.transforms = transforms
+        self.idx_to_class = {0: 'wall', 1: 'floor', 2: 'cabinet', 3: 'bed', 4: 'chair', 
+                5: 'sofa', 6: 'table', 7: 'door', 8: 'window', 9: 'bookshelf', 10: 'picture', 11: 'counter', 12: 'desk',
+                13: 'curtain', 14: 'refrigerator', 15: 'shower curtain', 16: 'toilet', 17: 'sink', 18: 'bathtub', 19: 'otherfurniture'}
+
+        if split == 'train' or split == 'val':
+            self.room_list = os.listdir(os.path.join(self.root, split))
+            self.room_list = [os.path.join(split, room) for room in self.room_list]
+        elif split == 'val_test':
+            self.room_list = os.listdir(os.path.join(self.root, 'val'))
+            self.room_list = [os.path.join('val', room) for room in self.room_list]
+    
+    def __len__(self):
+        return len(self.room_list) * self.loop
+    
+    def fnv_hash_vec(self, arr):
+        """
+        FNV64-1A
+        """
+        assert arr.ndim == 2
+        # Floor first for negative coordinates
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * \
+            np.ones(arr.shape[0], dtype=np.uint64)
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
+
+    def voxel_grid_sampling(self, pos):
+        """
+        pos.shape = (n, 3)
+        """
+        voxel_indices = np.floor(pos / self.voxel_size)
+        
+        voxel_hash = self.fnv_hash_vec(voxel_indices)
+        sort_idx = voxel_hash.argsort()
+        hash_sort = voxel_hash[sort_idx]
+        
+        _, counts = np.unique(hash_sort, return_counts=True)
+        if self.split == 'val_test':   # test时需要的东西和train，val时不同
+            return sort_idx, counts
+        
+        idx_select = np.cumsum(np.insert(counts, 0, 0)[0:-1]) + np.random.randint(0, counts.max(), counts.size) % counts
+        return sort_idx[idx_select]
+    
+    def __getitem__(self, index):
+        room = os.path.join(self.root, self.room_list[index % len(self.room_list)])
+        points = torch.load(room)
+        pos, color, y = points[0], points[1], points[2]
+        color = (color + 1) * 127.5   # [-1, 1] -> [0, 255]
+        
+        if self.transforms:
+            pos, color, _ = self.transforms(pos, color, None)
+        
+        if self.split == 'val_test':
+            sort_idx, counts = self.voxel_grid_sampling(pos)
+            pos, color, y = pos.astype(np.float32), color.astype(np.float32), y.astype(np.int64)
+            return pos, color, y, sort_idx, counts, room
+
+        # train, val的流程
+        sample_indices = self.voxel_grid_sampling(pos)
+        pos, color, y = pos[sample_indices], color[sample_indices], y[sample_indices]
+        
+        # 是否指定了npoints
+        if self.npoints:
+            n = len(sample_indices)
+            if n > self.npoints:
+                init_idx = np.random.randint(n)
+                crop_indices = np.argsort(np.sum(np.square(pos - pos[init_idx]), 1))[:self.npoints]
+            elif n < self.npoints:
+                temp = np.arange(n)
+                pad_choice = np.random.choice(n, self.npoints - n)
+                crop_indices = np.hstack([temp, temp[pad_choice]])
+            else:
+                crop_indices = np.arange(n)
+            
+            # 打乱
+            np.random.shuffle(crop_indices)
+        
+            pos, color, y = pos[crop_indices], color[crop_indices], y[crop_indices]
+        
+        pos, color, y = pos.astype(np.float32), color.astype(np.float32), y.astype(np.int64)
+        return pos, color, y
+
+
+def scan_valtest_collate_fn(batch):
+    pos, color, normal, y, sort_idx, counts, name = batch[0]
+    pos = torch.as_tensor(pos).unsqueeze(dim=0)
+    color = torch.as_tensor(color).unsqueeze(dim=0)
+    normal = torch.as_tensor(normal).unsqueeze(dim=0)
+    y = torch.as_tensor(y).unsqueeze(dim=0)
+    
+    return pos, color, normal, y, sort_idx, counts, name
+
+
+def scan_test_collate_fn(batch):
+    pos, color, normal, sort_idx, counts, name = batch[0]
+    pos = torch.as_tensor(pos).unsqueeze(dim=0)
+    color = torch.as_tensor(color).unsqueeze(dim=0)
+    normal = torch.as_tensor(normal).unsqueeze(dim=0)
+    
+    return pos, color, normal, sort_idx, counts, name
 
 
 if __name__ == '__main__':

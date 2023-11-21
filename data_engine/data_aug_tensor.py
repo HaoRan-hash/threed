@@ -7,11 +7,11 @@ class PointCloudFloorCenteringTensor:
     def __init__(self):
         pass
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         pos = pos - pos.mean(dim=1, keepdim=True)
         pos[:, :, 2] = pos[:, :, 2] - pos[:, :, 2].min()
         
-        return pos, x
+        return pos, color, normal
 
 
 class ColorNormalizeTensor:

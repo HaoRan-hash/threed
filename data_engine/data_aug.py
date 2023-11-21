@@ -116,18 +116,18 @@ class PointCloudCenterAndNormalize:
     def __init__(self):
         pass
     
-    def __call__(self, pos, x):
+    def __call__(self, pos, color, normal):
         # height append
         heights = pos[:, 1] - pos[:, 1].min()
         heights = np.expand_dims(heights, axis=1)
-        x = np.concatenate((x, heights), axis=1)
+        normal = np.concatenate((normal, heights), axis=1)
         
         # center and normalize
         pos = pos - pos.mean(axis=0)
         max_dis = (np.sqrt((np.square(pos)).sum(axis=1))).max()
         pos = pos / max_dis
         
-        return pos, x
+        return pos, color, normal
         
 
 class PointCloudJitter:
@@ -170,7 +170,7 @@ class NormalDrop:
         
     def __call__(self, pos, color, normal):
         if np.random.rand() < self.p:
-            normal[:, :] = 0
+            normal[:, :3] = 0
         return pos, color, normal
 
 
