@@ -4,8 +4,7 @@ import torch.nn.functional as F
 import fps_cuda
 import sys
 sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
-from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PEGenerator
-from memory import Memory
+from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts
 
 
 class PointSetAbstractionLayer(nn.Module):
@@ -121,81 +120,46 @@ class PointFeaturePropagationLayer(nn.Module):
         return final_features
 
 
-class Pointnet2_Memory(nn.Module):
-    def __init__(self, num_class, use_ddp):
-        super().__init__()
+class Pointnet2(nn.Module):
+    def __init__(self, num_class):
+        super(Pointnet2, self).__init__()
         self.sa1 = PointSetAbstractionLayer(4, 0.05, 32, 7+3, [32, 32, 64])
         self.sa2 = PointSetAbstractionLayer(4, 0.1, 32, 64+3, [64, 64, 128])
         self.sa3 = PointSetAbstractionLayer(4, 0.2, 32, 128+3, [128, 128, 256])
         self.sa4 = PointSetAbstractionLayer(4, 0.4, 32, 256+3, [256, 256, 512])
 
         self.fp1 = PointFeaturePropagationLayer(512+256, [256, 256])
-        self.pe_gen1 = PEGenerator(256)
-        self.coarse_mlp1 = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1, bias=False),
-                                        nn.BatchNorm1d(256),
-                                        nn.ReLU(inplace=True),
-                                        nn.Conv1d(256, num_class, kernel_size=1))
-        self.memory1 = Memory(num_class, 128, 256, 256, use_ddp=use_ddp)
-        
         self.fp2 = PointFeaturePropagationLayer(256+128, [256, 256])
-        self.pe_gen2 = PEGenerator(256)
-        self.coarse_mlp2 = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1, bias=False),
-                                        nn.BatchNorm1d(256),
-                                        nn.ReLU(inplace=True),
-                                        nn.Conv1d(256, num_class, kernel_size=1))
-        self.memory2 = Memory(num_class, 128, 256, 256, use_ddp=use_ddp)
-        
         self.fp3 = PointFeaturePropagationLayer(256+64, [256, 128])
         self.fp4 = PointFeaturePropagationLayer(128+7, [128, 128])
 
-        self.out_mlp = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1, bias=False),
-                                     nn.BatchNorm1d(256),
+        self.out_mlp = nn.Sequential(nn.Conv1d(128, 128, kernel_size=1, bias=False),
+                                     nn.BatchNorm1d(128),
+                                     nn.ReLU(inplace=True),
+                                     nn.Conv1d(128, 128, kernel_size=1, bias=False),
+                                     nn.BatchNorm1d(128),
                                      nn.ReLU(inplace=True),
                                      nn.Dropout(0.5),
-                                     nn.Conv1d(256, num_class, kernel_size=1))
+                                     nn.Conv1d(128, num_class, kernel_size=1))
 
-    def forward(self, pos, color, normal, y=None, epoch_ratio=None):
+    def forward(self, pos, color):
         """
         pos.shape = (b, n, 3)
         color.shape = (b, n, 3)
-        normal.shape = (b, n, 3)
         """
-        n = pos.shape[1]
-        height = pos[:, :, -1:]
-        x = torch.cat((color, height, normal), dim=-1)
+        height = pos[:, :, -1:] - pos[:, :, -1].min()
+        x = torch.cat((pos, color, height), dim=-1)
 
-        pos1, x1, y1 = self.sa1(pos, x, y)
-        pos2, x2, y2 = self.sa2(pos1, x1, y1)
-        pos3, x3, y3 = self.sa3(pos2, x2, y2)
-        pos4, x4, y4 = self.sa4(pos3, x3, y3)
+        pos1, x1, _ = self.sa1(pos, x)
+        pos2, x2, _ = self.sa2(pos1, x1)
+        pos3, x3, _ = self.sa3(pos2, x2)
+        pos4, x4, _ = self.sa4(pos3, x3)
 
         x3 = self.fp1(pos3, x3, pos4, x4)
-        # 给x3加上pe
-        x3 = self.pe_gen1(pos3, x3, 0.4, 32)
-        coarse_pred1 = self.coarse_mlp1(x3.transpose(1, 2))
-        coarse_seg_loss1 = 0
-        if self.training:
-            coarse_seg_loss1 = F.cross_entropy(coarse_pred1, y3, label_smoothing=0.2, ignore_index=20)
-            self.memory1.update(x3, y3, coarse_pred1, epoch_ratio)
-        x3, _ = self.memory1(x3, coarse_pred1, None)
-            
         x2 = self.fp2(pos2, x2, pos3, x3)
-        # 给x2加上pe
-        x2 = self.pe_gen2(pos2, x2, 0.2, 32)
-        coarse_pred2 = self.coarse_mlp2(x2.transpose(1, 2))
-        coarse_seg_loss2 = 0
-        if self.training:
-            coarse_seg_loss2 = F.cross_entropy(coarse_pred2, y2, label_smoothing=0.2, ignore_index=20)
-            self.memory2.update(x2, y2, coarse_pred2, epoch_ratio)
-        x2, contrast_loss = self.memory2(x2, coarse_pred2, y2)
-            
         x1 = self.fp3(pos1, x1, pos2, x2)
         x = self.fp4(pos, x, pos1, x1)
-        
-        x_max = x.max(dim=1, keepdim=True)[0].expand(-1, n, -1)
-        x = torch.cat((x, x_max), dim=-1)
 
         y_pred = self.out_mlp(x.transpose(1, 2))
-        coarse_seg_loss = coarse_seg_loss1 * 0.1 + coarse_seg_loss2 * 0.1
 
-        return y_pred, coarse_seg_loss, contrast_loss * 0
+        return y_pred

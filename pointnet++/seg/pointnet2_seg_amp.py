@@ -6,7 +6,8 @@ from ignite.metrics import Accuracy, ConfusionMatrix, IoU, mIoU
 from tqdm import tqdm
 import json
 import sys
-sys.path.append('/mnt/Disk16T/chenhr/threed/pointnet++')
+sys.path.append('/mnt/Disk16T/chenhr/threed/data_engine')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts
 from dataset import S3dis
 from data_aug import *
@@ -149,12 +150,12 @@ class Pointnet2(nn.Module):
                                      nn.Dropout(0.5),
                                      nn.Conv1d(128, num_class, kernel_size=1))
 
-    def forward(self, pos, x, y=None):
+    def forward(self, pos, color, y=None):
         """
         pos.shape = (b, n, 3)
-        x.shape = (b, n, 3)
+        color.shape = (b, n, 3)
         """
-        x = torch.cat((pos[:, :, -1:], x), dim=-1)
+        x = torch.cat((pos[:, :, -1:], color), dim=-1)
 
         pos1, x1, y1 = self.sa1(pos, x, y)
         pos2, x2, y2 = self.sa2(pos1, x1, y1)
