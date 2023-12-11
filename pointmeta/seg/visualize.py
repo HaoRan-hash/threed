@@ -10,6 +10,7 @@ from dataset import S3dis
 from data_aug import *
 from data_aug_tensor import *
 from memorynet_seg_4_contrast import Memorynet
+from pointmeta_seg import PointMeta
 
 
 def gen_color(y):
@@ -28,10 +29,10 @@ def gen_color(y):
     return res
 
 
-save_dir = Path('/mnt/Disk16T/chenhr/threed/pointmeta/seg/vis_results/pointmeta_mem')
+save_dir = Path('/mnt/Disk16T/chenhr/threed/pointmeta/seg/vis_results/baseline')
 gt_dir = Path('/mnt/Disk16T/chenhr/threed/pointmeta/seg/vis_results/gt')
 def test_entire_room(dataloader, test_transform, model, device, model_path, save_gt=False):
-    model.load_state_dict(torch.load(model_path)['model_state_dict'])
+    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
     model.eval()
     
     pbar = tqdm(dataloader)
@@ -58,7 +59,7 @@ def test_entire_room(dataloader, test_transform, model, device, model_path, save
                 
                 # 做变换
                 cur_pos, cur_color, _ = test_transform(cur_pos, cur_color, None)
-                cur_pred, _, _ = model(cur_pos, cur_color)
+                cur_pred = model(cur_pos, cur_color)
                 all_pred[:, :, idx_select] += cur_pred
             
             all_pred = all_pred / all_idx.unsqueeze(dim=1)
@@ -139,16 +140,18 @@ def multi_scale_test(dataloader, test_transform, model, device, model_path, save
 if __name__ == '__main__':
     device = 'cuda:7'
 
-    memorynet = Memorynet(13, 4, 32, [4, 8, 4, 4]).to(device)
+    model = PointMeta(13, 4, 32, [4, 8, 4, 4]).to(device)
+    # model = Memorynet(13, 4, 32, [4, 8, 4, 4]).to(device)   # memory版
     
-    model_path = 'pointmeta/seg/checkpoints/memorynet_seg_4_contrast_area5.pth'
+    model_path = 'seg/checkpoints/pointmeta_seg_0001lr.pth'
+    # model_path = 'seg/checkpoints/memorynet_seg_4_contrast_area5.pth'   # memory版
     
     # test entire room
     test_aug = Compose([PointCloudFloorCenteringTensor(),
                         ColorNormalizeTensor()])
     test_dataset = S3dis('/mnt/Disk16T/chenhr/threed_data/data/processed_s3dis', split='test', loop=1, test_area=5)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8)
-    test_entire_room(test_dataloader, test_aug, memorynet, device, model_path, save_gt=True)
+    test_entire_room(test_dataloader, test_aug, model, device, model_path)
 
     #multi scale test
-    multi_scale_test(test_dataloader, test_aug, memorynet, device, model_path)
+    # multi_scale_test(test_dataloader, test_aug, model, device, model_path, save_gt=True)   # memory版

@@ -163,15 +163,15 @@ class PointMeta(nn.Module):
                                     nn.Dropout(0.5),
                                     nn.Conv1d(480, class_num, kernel_size=1))
 
-    def forward(self, pos, x, object_labels, y=None):
+    def forward(self, pos, normal, object_labels, y=None):
         """
         pos.shape = (b, n, 3)
-        x.shape = (b, n, 4)
+        normal.shape = (b, n, 4)
         object_labels.shape = (b,)
         y.shape = (b, n)
         """
         n = pos.shape[1]
-        x = torch.cat((pos, x), dim=-1)
+        x = torch.cat((pos, normal), dim=-1)
         x = self.in_linear(x)
 
         object_labels = F.one_hot(object_labels, 16).to(dtype=torch.float32)
@@ -195,7 +195,7 @@ class PointMeta(nn.Module):
         x = torch.cat((x, x_max, x_mean), dim=-1)
         y_pred = self.mlp(x.transpose(1, 2))
 
-        return y_pred, None, None
+        return y_pred
 
 
 def train_loop(dataloader, model, loss_fn, metric_fn, optimizer, device, 

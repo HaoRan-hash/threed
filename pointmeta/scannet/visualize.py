@@ -38,7 +38,7 @@ def gen_color(y):
 save_dir = Path('/mnt/Disk16T/chenhr/threed/pointmeta/scannet/vis_results/memory')
 gt_dir = Path('/mnt/Disk16T/chenhr/threed/pointmeta/scannet/vis_results/gt')
 def test_entire_room(dataloader, test_transform, model, device, model_path, rank, save_gt=False):
-    # model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
+    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
     model.eval()
     
     if rank == 0:
@@ -76,6 +76,7 @@ def test_entire_room(dataloader, test_transform, model, device, model_path, rank
                 all_pred[:, :, idx_select] += cur_pred
             
             all_pred = all_pred / all_idx.unsqueeze(dim=1)
+            dist.barrier()
             
             # visualize
             save_file_name = save_dir / (str(name.stem) + '.txt')

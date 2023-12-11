@@ -12,6 +12,7 @@ from dataset import ShapeNet
 from data_aug import *
 from data_aug_tensor import *
 from memorynet_partseg_contrast_nopeg import Memorynet, object_to_part
+from pointmeta_partseg import PointMeta
 
 
 def gen_color(y):
@@ -67,7 +68,8 @@ def voting_test(dataloader, model, device, model_path, voting_num, save_gt=False
             y_pred = torch.zeros((pos.shape[0], 50, pos.shape[1]), dtype=torch.float32, device=device)
             for _ in range(voting_num):
                 temp_pos, _, temp_normal = voting_transforms(pos, None, normal)
-                temp_pred, _, _ = model(temp_pos, temp_normal, object_labels)
+                # temp_pred = model(temp_pos, temp_normal, object_labels)
+                temp_pred, _, _ = model(temp_pos, temp_normal, object_labels)   # memory版
                 y_pred += temp_pred
             y_pred = y_pred / voting_num
             
@@ -80,7 +82,7 @@ def voting_test(dataloader, model, device, model_path, voting_num, save_gt=False
             cur_y = y[0]
             
             # refine seg
-            cur_y_pred = refine_seg(cur_y_pred, pos[0], 10, device)
+            cur_y_pred = refine_seg(cur_y_pred, pos[0], 10, device)   # memory版使用
             
             # visualize
             shape_name = idx_to_class[cur_object_label]
@@ -109,13 +111,15 @@ def voting_test(dataloader, model, device, model_path, voting_num, save_gt=False
 if __name__ == '__main__':
     device = 'cuda:6'
 
-    memorynet = Memorynet(50).to(device)
+    # model = PointMeta(50).to(device)
+    model = Memorynet(50).to(device)   # memory版
 
-    model_path = 'pointmeta/partseg/checkpoints/memorynet_partseg_contrast_nopeg.pth'
+    # model_path = 'partseg/checkpoints/pointmeta_partseg.pth'
+    model_path = 'partseg/checkpoints/memorynet_partseg_contrast_nopeg.pth'   # memory版
     
     # voting test
     test_aug = Compose([PointCloudCenterAndNormalize()])
     test_dataset = ShapeNet('/mnt/Disk16T/chenhr/threed_data/data/shapenetcore_partanno_segmentation_benchmark_v0_normal', 
                             split='test', npoints=2048, transforms=test_aug)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8)
-    voting_test(test_dataloader, memorynet, device, model_path, 10, save_gt=True)
+    voting_test(test_dataloader, model, device, model_path, 10, save_gt=False)   # memory时save_gt，voting_num设为10

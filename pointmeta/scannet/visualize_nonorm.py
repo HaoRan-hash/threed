@@ -75,6 +75,7 @@ def test_entire_room(dataloader, test_transform, model, device, model_path, rank
             all_pred = all_pred / all_idx.unsqueeze(dim=1)
             
             # visualize
+            pos = pos - pos.min(dim=1)[0]
             name = name[0].split('/')[-1][:-4]
             save_file_name = save_dir / (name + '.txt')
             all_pred = all_pred.argmax(dim=1)
