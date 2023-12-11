@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import fps_cuda
 import sys
-sys.path.append('/home/lindi/chenhr/threed/utils')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts
 
 
@@ -188,21 +188,19 @@ class PointNeXt(nn.Module):
         self.fp3 = PointFeaturePropagationLayer(256+128, [128, 128])
         self.fp4 = PointFeaturePropagationLayer(128+64, [64, 64])
         
-        self.out_mlp = nn.Sequential(nn.Conv1d(128, 128, kernel_size=1, bias=False),
-                                     nn.BatchNorm1d(128),
+        self.out_mlp = nn.Sequential(nn.Conv1d(64, 64, kernel_size=1, bias=False),
+                                     nn.BatchNorm1d(64),
                                      nn.ReLU(inplace=True),
                                      nn.Dropout(0.5),
-                                     nn.Conv1d(128, num_class, kernel_size=1))
+                                     nn.Conv1d(64, num_class, kernel_size=1))
     
-    def forward(self, pos, color, normal):
+    def forward(self, pos, color):
         """
         pos.shape = (b, n, 3)
         color.shape = (b, n, 3)
-        normal.shape = (b, n, 3)
         """
-        n = pos.shape[1]
-        height = pos[:, :, -1:]
-        x = torch.cat((color, height, normal), dim=-1)
+        height = pos[:, :, -1:] - pos[:, :, -1].min()
+        x = torch.cat((pos, color, height), dim=-1)
         x = self.in_linear(x)
         
         pos1, x1, _ = self.stage1(pos, x)
@@ -214,9 +212,6 @@ class PointNeXt(nn.Module):
         x2 = self.fp2(pos2, x2, pos3, x3)
         x1 = self.fp3(pos1, x1, pos2, x2)
         x = self.fp4(pos, x, pos1, x1)
-        
-        x_max = x.max(dim=1, keepdim=True)[0].expand(-1, n, -1)
-        x = torch.cat((x, x_max), dim=-1)
         
         y_pred = self.out_mlp(x.transpose(1, 2))
         

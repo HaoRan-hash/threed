@@ -7,7 +7,8 @@ from ignite.metrics import Accuracy, ConfusionMatrix, IoU, mIoU
 from tqdm import tqdm
 import json
 import sys
-sys.path.append('/home/lindi/chenhr/threed/pointnext')
+sys.path.append('/mnt/Disk16T/chenhr/threed/data_engine')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, SemanticAwareAttention, PEGenerator
 from dataset import S3dis
 from data_aug import *
@@ -328,13 +329,13 @@ class Memorynet(nn.Module):
                                      nn.Dropout(0.5),
                                      nn.Conv1d(64, num_class, kernel_size=1))
     
-    def forward(self, pos, x, y=None, epoch_ratio=None):
+    def forward(self, pos, color, y=None, epoch_ratio=None):
         """
         pos.shape = (b, n, 3)
-        x.shape = (b, n, c)
+        color.shape = (b, n, 3)
         y.shape = (b, n)
         """
-        x = torch.cat((pos[:, :, -1:], x), dim=-1)
+        x = torch.cat((pos[:, :, -1:], color), dim=-1)
         x = self.in_linear(x)
         
         pos1, x1, y1 = self.stage1(pos, x, y)

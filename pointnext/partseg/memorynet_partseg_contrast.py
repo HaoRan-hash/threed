@@ -6,7 +6,8 @@ import torch.nn.functional as F
 from ignite.metrics import Accuracy
 from tqdm import tqdm
 import sys
-sys.path.append('/home/lindi/chenhr/threed/pointnext')
+sys.path.append('/mnt/Disk16T/chenhr/threed/data_engine')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PolyFocalLoss, SemanticAwareAttention_Mask, PEGenerator
 from dataset import ShapeNet
 from data_aug import *
@@ -300,10 +301,10 @@ class Memorynet(nn.Module):
                                     nn.Dropout(0.5),
                                     nn.Conv1d(480, num_class, kernel_size=1))
 
-    def forward(self, pos, x, object_labels, y=None, epoch_ratio=None):
+    def forward(self, pos, normal, object_labels, y=None, epoch_ratio=None):
         """
         pos.shape = (b, n, 3)
-        x.shape = (b, n, 4)
+        normal.shape = (b, n, 4)
         object_labels.shape = (b,)
         y.shape = (b, n)
         """
@@ -314,7 +315,7 @@ class Memorynet(nn.Module):
         mask_float = mask_float.unsqueeze(dim=1)
         
         n = pos.shape[1]
-        x = torch.cat((pos, x), dim=-1)
+        x = torch.cat((pos, normal), dim=-1)
         x = self.in_linear(x)
 
         pos1, x1, y1 = self.sa1(pos, x, y)
@@ -569,7 +570,7 @@ def get_parameter_groups(model, weight_decay, log_dir):
     return list(parameter_group_vars.values())
 
 
-object_to_part_onehot = torch.zeros((16, 50), dtype=torch.uint8, device='cuda:1')
+object_to_part_onehot = torch.zeros((16, 50), dtype=torch.uint8, device='cuda:6')
 def transform_object_label():
     for i in range(16):
         for part in object_to_part[i]:

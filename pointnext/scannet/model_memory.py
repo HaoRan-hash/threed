@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import fps_cuda
 import sys
-sys.path.append('/home/lindi/chenhr/threed/pointnext')
+sys.path.append('/mnt/Disk16T/chenhr/threed/utils')
 from utils_func import ball_query_cuda2, knn_query_cuda2, index_points, index_gts, PEGenerator
 from memory import Memory
 
